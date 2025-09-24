@@ -20,19 +20,19 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "@coral-xyz/anchor": "^0.28.0",
-    "@solana/web3.js": "^1.87.6",
-    "@solana/spl-token": "^0.3.9"
+    "@coral-xyz/anchor": "0.31.0",
+    "@solana/spl-token": "^0.3.9",
+    "@solana/web3.js": "^1.87.6"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
-    "typescript": "^5.3.0",
-    "ts-node": "^10.9.0",
-    "eslint": "^8.55.0",
-    "prettier": "^3.1.0",
     "chai": "^4.3.10",
+    "eslint": "^8.55.0",
     "mocha": "^10.2.0",
-    "ts-mocha": "^10.0.0"
+    "prettier": "^3.1.0",
+    "ts-mocha": "^10.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.3.0"
   },
   "engines": {
     "node": ">=16.0.0"

@@ -5,6 +5,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { StakingRewardsContract } from "../target/types/staking_rewards_contract";
+import idl from "../target/idl/staking_rewards_contract.json";
 import {
   TOKEN_PROGRAM_ID,
   createMint,
@@ -20,7 +21,6 @@ describe("staking-rewards-contract", () => {
   anchor.setProvider(provider);
 
   const program = anchor.workspace.StakingRewardsContract as Program<StakingRewardsContract>;
-
   // Test accounts
   let admin: anchor.web3.Keypair;
   let user: anchor.web3.Keypair;

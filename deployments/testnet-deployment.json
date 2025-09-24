@@ -1,0 +1,12 @@
+{
+  "network": "testnet",
+  "programId": "AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N",
+  "admin": "ExE7s4rvdQw3QAGAMoaqJXBMMTczwxNuRTAYPHbQtyB1",
+  "treasury": "2bP3HuccMJnut5yYAUxgFRzbzFQ9w2xshRuMFJEbnd15",
+  "tokenMint": "4srETGbTwqfVh1pzwcNhh7eT3wvYN9m4G2KkmPsdunTU",
+  "programState": "FiZqTvPN8oE1p4zTuaB73716yHgq9Jh7WzwDEQ7dTXt2",
+  "programVault": "Rti3vxgbyBuxVyMbSBmwKDx4j7g7kqMBhqXHiEto5rj",
+  "stakingTier": "4Mu26DwypetEgdDxHUUDv8mGgzXT8mh3RPH6Uc4E5dXs",
+  "programVaultTokenAccount": "7mFm69uKvzbBcyehxmFfMwRs4eXEo5yGovA9a35hqJ9P",
+  "deploymentDate": "2025-09-24T09:10:10.367Z"
+}

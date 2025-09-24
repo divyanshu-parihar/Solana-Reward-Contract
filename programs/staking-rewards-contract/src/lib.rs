@@ -1,36 +1,23 @@
-// programs/staking-rewards-contract/src/lib.rs
-// Production-Ready Solana Staking & Rewards Smart Contract
-// Enhanced with comprehensive security, error handling, and optimizations
-
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use std::cmp;
 
 declare_id!("AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N");
 
-// ================================
-// CONSTANTS & CONFIGURATION
-// ================================
-
 const WEEK_IN_SECONDS: i64 = 604800;
-const MAX_APY: u64 = 75; // 75% maximum APY
-const EARLY_UNSTAKE_PENALTY: u64 = 50; // 50% penalty
-const REWARD_DISTRIBUTION_REFERRAL: u64 = 30; // 30%
-const REWARD_DISTRIBUTION_CASHBACK: u64 = 30; // 30%
-const REWARD_DISTRIBUTION_STAKING: u64 = 40; // 40%
-const VESTING_PERIOD_SECONDS: i64 = 30 * 24 * 60 * 60; // 30 days
-const MIN_STAKE_AMOUNT: u64 = 1_000_000; // Minimum stake amount (0.001 tokens with 9 decimals)
-const MAX_STAKE_AMOUNT: u64 = 1_000_000_000_000_000; // Maximum stake amount per position
-
-// ================================
-// MAIN PROGRAM
-// ================================
+const MAX_APY: u64 = 75;
+const EARLY_UNSTAKE_PENALTY: u64 = 50;
+const REWARD_DISTRIBUTION_REFERRAL: u64 = 30;
+const REWARD_DISTRIBUTION_CASHBACK: u64 = 30;
+const REWARD_DISTRIBUTION_STAKING: u64 = 40;
+const VESTING_PERIOD_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MIN_STAKE_AMOUNT: u64 = 1_000_000;
+const MAX_STAKE_AMOUNT: u64 = 1_000_000_000_000_000;
 
 #[program]
 pub mod staking_rewards_contract {
     use super::*;
 
-    /// Initialize the staking program
     pub fn initialize(
         ctx: Context<Initialize>,
         admin: Pubkey,
@@ -57,7 +44,6 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Create a new staking tier
     pub fn create_staking_tier(
         ctx: Context<CreateStakingTier>,
         tier_id: u8,
@@ -65,7 +51,6 @@ pub mod staking_rewards_contract {
         min_duration_months: u8,
         max_duration_months: u8,
     ) -> Result<()> {
-        // Validation
         validate_tier_params(multiplier, min_duration_months, max_duration_months)?;
 
         let staking_tier = &mut ctx.accounts.staking_tier;
@@ -86,16 +71,14 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Stake tokens with specified parameters
     pub fn stake_tokens(
         ctx: Context<StakeTokens>,
         amount: u64,
         duration_months: u8,
         tier_id: u8,
         is_locked: bool,
-        position_seed: u64,
+        _position_seed: u64,
     ) -> Result<()> {
-        // Security checks
         prevent_reentrancy(&ctx.accounts.program_state)?;
         require!(
             amount >= MIN_STAKE_AMOUNT && amount <= MAX_STAKE_AMOUNT,
@@ -114,7 +97,6 @@ pub mod staking_rewards_contract {
             StakingError::DurationNotAllowed
         );
 
-        // Validate token accounts
         validate_token_account(
             &ctx.accounts.user_token_account,
             &ctx.accounts.staker.key(),
@@ -124,7 +106,6 @@ pub mod staking_rewards_contract {
         let clock = Clock::get()?;
         let stake_position = &mut ctx.accounts.stake_position;
 
-        // Initialize stake position
         stake_position.owner = ctx.accounts.staker.key();
         stake_position.amount = amount;
         stake_position.tier_id = tier_id;
@@ -139,18 +120,16 @@ pub mod staking_rewards_contract {
         stake_position.is_active = true;
         stake_position.bump = ctx.bumps.stake_position;
 
-        // Transfer tokens to program vault
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
                 from: ctx.accounts.user_token_account.to_account_info(),
-                to: ctx.accounts.program_vault.to_account_info(),
+                to: ctx.accounts.program_vault_token_account.to_account_info(),
                 authority: ctx.accounts.staker.to_account_info(),
             },
         );
         token::transfer(transfer_ctx, amount)?;
 
-        // Update global state safely
         ctx.accounts.program_state.total_staked = ctx
             .accounts
             .program_state
@@ -170,8 +149,7 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Unstake tokens with penalty calculation for early unstaking
-    pub fn unstake_tokens(ctx: Context<UnstakeTokens>, position_seed: u64) -> Result<()> {
+    pub fn unstake_tokens(ctx: Context<UnstakeTokens>, _position_seed: u64) -> Result<()> {
         prevent_reentrancy(&ctx.accounts.program_state)?;
 
         let stake_position = &mut ctx.accounts.stake_position;
@@ -183,7 +161,6 @@ pub mod staking_rewards_contract {
         let mut transfer_amount = stake_position.amount;
         let mut penalty_amount = 0u64;
 
-        // Apply penalty for early locked unstaking
         if is_early_unstake && stake_position.is_locked {
             penalty_amount = calculate_early_unstake_penalty(
                 stake_position.amount,
@@ -196,23 +173,18 @@ pub mod staking_rewards_contract {
                 .checked_sub(penalty_amount)
                 .ok_or(StakingError::CalculationOverflow)?;
 
-            // Split penalty: 50% to reward pool, 50% to treasury
             let to_reward_pool = penalty_amount
                 .checked_div(2)
                 .ok_or(StakingError::CalculationOverflow)?;
             let to_treasury = penalty_amount
                 .checked_sub(to_reward_pool)
                 .ok_or(StakingError::CalculationOverflow)?;
-
-            // Update reward pool
             ctx.accounts.program_state.reward_pool = ctx
                 .accounts
                 .program_state
                 .reward_pool
                 .checked_add(to_reward_pool)
                 .ok_or(StakingError::CalculationOverflow)?;
-
-            // Transfer penalty to treasury if > 0
             if to_treasury > 0 {
                 let seeds = &[
                     b"program_vault".as_ref(),
@@ -223,7 +195,7 @@ pub mod staking_rewards_contract {
                 let transfer_ctx = CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
                     Transfer {
-                        from: ctx.accounts.program_vault.to_account_info(),
+                        from: ctx.accounts.program_vault_token_account.to_account_info(),
                         to: ctx.accounts.treasury_token_account.to_account_info(),
                         authority: ctx.accounts.program_vault.to_account_info(),
                     },
@@ -233,7 +205,6 @@ pub mod staking_rewards_contract {
             }
         }
 
-        // Transfer tokens back to user
         let seeds = &[
             b"program_vault".as_ref(),
             &[ctx.accounts.program_vault.bump],
@@ -243,7 +214,7 @@ pub mod staking_rewards_contract {
         let transfer_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from: ctx.accounts.program_vault.to_account_info(),
+                from: ctx.accounts.program_vault_token_account.to_account_info(),
                 to: ctx.accounts.user_token_account.to_account_info(),
                 authority: ctx.accounts.program_vault.to_account_info(),
             },
@@ -251,7 +222,6 @@ pub mod staking_rewards_contract {
         );
         token::transfer(transfer_ctx, transfer_amount)?;
 
-        // Update global state
         ctx.accounts.program_state.total_staked = ctx
             .accounts
             .program_state
@@ -272,11 +242,10 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Claim rewards and create vesting NFT
     pub fn claim_rewards(
         ctx: Context<ClaimRewards>,
-        position_seed: u64,
-        nft_seed: u64,
+        _position_seed: u64,
+        _nft_seed: u64,
     ) -> Result<()> {
         let stake_position = &mut ctx.accounts.stake_position;
         require!(stake_position.is_active, StakingError::StakeNotActive);
@@ -296,7 +265,6 @@ pub mod staking_rewards_contract {
             weeks_elapsed as u64,
         )?;
 
-        // Apply APY cap
         let max_weekly_reward = calculate_max_weekly_reward(stake_position.amount)?;
         let final_reward = cmp::min(
             reward_amount,
@@ -305,14 +273,12 @@ pub mod staking_rewards_contract {
                 .ok_or(StakingError::CalculationOverflow)?,
         );
 
-        // Check reward pool has sufficient balance
         require!(
             ctx.accounts.program_state.reward_pool >= final_reward,
             StakingError::InsufficientRewardPool
         );
 
         if final_reward > 0 {
-            // Create NFT for reward vesting
             let reward_nft = &mut ctx.accounts.reward_nft;
             reward_nft.owner = ctx.accounts.staker.key();
             reward_nft.reward_amount = final_reward;
@@ -320,13 +286,11 @@ pub mod staking_rewards_contract {
             reward_nft.is_active = true;
             reward_nft.bump = ctx.bumps.reward_nft;
 
-            // Update accumulated rewards
             stake_position.accumulated_rewards = stake_position
                 .accumulated_rewards
                 .checked_add(final_reward)
                 .ok_or(StakingError::CalculationOverflow)?;
 
-            // Deduct from reward pool
             ctx.accounts.program_state.reward_pool = ctx
                 .accounts
                 .program_state
@@ -347,8 +311,7 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Vest NFT rewards after vesting period
-    pub fn vest_reward_nft(ctx: Context<VestRewardNft>, nft_seed: u64) -> Result<()> {
+    pub fn vest_reward_nft(ctx: Context<VestRewardNft>, _nft_seed: u64) -> Result<()> {
         let reward_nft = &ctx.accounts.reward_nft;
         require!(reward_nft.is_active, StakingError::NFTAlreadyVested);
 
@@ -358,7 +321,6 @@ pub mod staking_rewards_contract {
             StakingError::VestingNotComplete
         );
 
-        // Transfer reward tokens to user
         let seeds = &[
             b"program_vault".as_ref(),
             &[ctx.accounts.program_vault.bump],
@@ -368,7 +330,7 @@ pub mod staking_rewards_contract {
         let transfer_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from: ctx.accounts.program_vault.to_account_info(),
+                from: ctx.accounts.program_vault_token_account.to_account_info(),
                 to: ctx.accounts.user_token_account.to_account_info(),
                 authority: ctx.accounts.program_vault.to_account_info(),
             },
@@ -376,7 +338,6 @@ pub mod staking_rewards_contract {
         );
         token::transfer(transfer_ctx, reward_nft.reward_amount)?;
 
-        // Mark NFT as vested
         let reward_nft = &mut ctx.accounts.reward_nft;
         let vested_amount = reward_nft.reward_amount;
         reward_nft.is_active = false;
@@ -390,7 +351,6 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Distribute weekly rewards across pools
     pub fn distribute_weekly_rewards(
         ctx: Context<DistributeWeeklyRewards>,
         total_rewards: u64,
@@ -404,10 +364,8 @@ pub mod staking_rewards_contract {
             WEEK_IN_SECONDS,
         )?;
 
-        // Validate distribution
         validate_reward_distribution()?;
 
-        // Calculate distribution amounts
         let referral_amount = total_rewards
             .checked_mul(REWARD_DISTRIBUTION_REFERRAL)
             .ok_or(StakingError::CalculationOverflow)?
@@ -426,7 +384,6 @@ pub mod staking_rewards_contract {
             .checked_div(100)
             .ok_or(StakingError::CalculationOverflow)?;
 
-        // Verify total distribution equals input
         let total_distributed = referral_amount
             .checked_add(cashback_amount)
             .ok_or(StakingError::CalculationOverflow)?
@@ -437,7 +394,6 @@ pub mod staking_rewards_contract {
             StakingError::InvalidDistribution
         );
 
-        // Update program state
         program_state.reward_pool = program_state
             .reward_pool
             .checked_add(staking_amount)
@@ -459,7 +415,6 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Emergency pause program (admin only)
     pub fn pause_program(ctx: Context<AdminOnly>) -> Result<()> {
         ctx.accounts.program_state.is_paused = true;
 
@@ -470,7 +425,6 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Unpause program (admin only)
     pub fn unpause_program(ctx: Context<AdminOnly>) -> Result<()> {
         ctx.accounts.program_state.is_paused = false;
 
@@ -481,7 +435,6 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Placeholder for future buyback and burn functionality
     pub fn buyback_and_burn(ctx: Context<BuybackAndBurn>, amount: u64) -> Result<()> {
         require!(amount > 0, StakingError::InvalidAmount);
 
@@ -493,7 +446,6 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Update staking tier (admin only)
     pub fn update_staking_tier(
         ctx: Context<UpdateStakingTier>,
         tier_id: u8,
@@ -521,22 +473,19 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    /// Add funds to reward pool (admin only)
     pub fn add_reward_funds(ctx: Context<AddRewardFunds>, amount: u64) -> Result<()> {
         require!(amount > 0, StakingError::InvalidAmount);
 
-        // Transfer tokens to program vault
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
                 from: ctx.accounts.admin_token_account.to_account_info(),
-                to: ctx.accounts.program_vault.to_account_info(),
+                to: ctx.accounts.program_vault_token_account.to_account_info(),
                 authority: ctx.accounts.admin.to_account_info(),
             },
         );
         token::transfer(transfer_ctx, amount)?;
 
-        // Update reward pool
         ctx.accounts.program_state.reward_pool = ctx
             .accounts
             .program_state
@@ -552,23 +501,18 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 }
-
-// ================================
-// ACCOUNT STRUCTURES
-// ================================
-
 #[account]
 #[derive(Debug)]
 pub struct ProgramState {
-    pub admin: Pubkey,             // 32
-    pub reward_token_mint: Pubkey, // 32
-    pub protocol_treasury: Pubkey, // 32
-    pub current_epoch: u64,        // 8
-    pub total_staked: u64,         // 8
-    pub reward_pool: u64,          // 8
-    pub is_paused: bool,           // 1
-    pub last_epoch_timestamp: i64, // 8
-    pub bump: u8,                  // 1
+    pub admin: Pubkey,             
+    pub reward_token_mint: Pubkey, 
+    pub protocol_treasury: Pubkey, 
+    pub current_epoch: u64,        
+    pub total_staked: u64,         
+    pub reward_pool: u64,          
+    pub is_paused: bool,           
+    pub last_epoch_timestamp: i64, 
+    pub bump: u8,                  
 }
 
 impl ProgramState {
@@ -578,12 +522,12 @@ impl ProgramState {
 #[account]
 #[derive(Debug)]
 pub struct StakingTier {
-    pub tier_id: u8,             // 1
-    pub multiplier: u64,         // 8
-    pub min_duration_months: u8, // 1
-    pub max_duration_months: u8, // 1
-    pub is_active: bool,         // 1
-    pub bump: u8,                // 1
+    pub tier_id: u8,             
+    pub multiplier: u64,         
+    pub min_duration_months: u8, 
+    pub max_duration_months: u8, 
+    pub is_active: bool,         
+    pub bump: u8,                
 }
 
 impl StakingTier {
@@ -593,18 +537,18 @@ impl StakingTier {
 #[account]
 #[derive(Debug)]
 pub struct StakePosition {
-    pub owner: Pubkey,              // 32
-    pub amount: u64,                // 8
-    pub tier_id: u8,                // 1
-    pub multiplier: u64,            // 8
-    pub duration_months: u8,        // 1
-    pub is_locked: bool,            // 1
-    pub start_timestamp: i64,       // 8
-    pub unlock_timestamp: i64,      // 8
-    pub last_reward_timestamp: i64, // 8
-    pub accumulated_rewards: u64,   // 8
-    pub is_active: bool,            // 1
-    pub bump: u8,                   // 1
+    pub owner: Pubkey,              
+    pub amount: u64,                
+    pub tier_id: u8,                
+    pub multiplier: u64,            
+    pub duration_months: u8,        
+    pub is_locked: bool,            
+    pub start_timestamp: i64,       
+    pub unlock_timestamp: i64,      
+    pub last_reward_timestamp: i64, 
+    pub accumulated_rewards: u64,   
+    pub is_active: bool,            
+    pub bump: u8,                   
 }
 
 impl StakePosition {
@@ -614,11 +558,11 @@ impl StakePosition {
 #[account]
 #[derive(Debug)]
 pub struct RewardNFT {
-    pub owner: Pubkey,       // 32
-    pub reward_amount: u64,  // 8
-    pub vest_timestamp: i64, // 8
-    pub is_active: bool,     // 1
-    pub bump: u8,            // 1
+    pub owner: Pubkey,       
+    pub reward_amount: u64,  
+    pub vest_timestamp: i64, 
+    pub is_active: bool,     
+    pub bump: u8,            
 }
 
 impl RewardNFT {
@@ -628,17 +572,12 @@ impl RewardNFT {
 #[account]
 #[derive(Debug)]
 pub struct ProgramVault {
-    pub bump: u8, // 1
+    pub bump: u8, 
 }
 
 impl ProgramVault {
     pub const LEN: usize = 8 + 1;
 }
-
-// ================================
-// CONTEXT STRUCTURES
-// ================================
-
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
@@ -722,6 +661,12 @@ pub struct StakeTokens<'info> {
         bump
     )]
     pub program_vault: Account<'info, ProgramVault>,
+    #[account(
+        mut,
+        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
+        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub program_vault_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -755,6 +700,12 @@ pub struct UnstakeTokens<'info> {
         bump
     )]
     pub program_vault: Account<'info, ProgramVault>,
+    #[account(
+        mut,
+        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
+        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub program_vault_token_account: Account<'info, TokenAccount>,
     #[account(
         mut,
         constraint = treasury_token_account.owner == program_state.protocol_treasury @ StakingError::InvalidTokenAccount
@@ -821,6 +772,12 @@ pub struct VestRewardNft<'info> {
         bump
     )]
     pub program_vault: Account<'info, ProgramVault>,
+    #[account(
+        mut,
+        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
+        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub program_vault_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -901,13 +858,14 @@ pub struct AddRewardFunds<'info> {
         bump
     )]
     pub program_vault: Account<'info, ProgramVault>,
+    #[account(
+        mut,
+        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
+        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub program_vault_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
-
-// ================================
-// EVENTS
-// ================================
-
 #[event]
 pub struct ProgramInitialized {
     pub admin: Pubkey,
@@ -994,11 +952,6 @@ pub struct RewardFundsAdded {
     pub admin: Pubkey,
     pub amount: u64,
 }
-
-// ================================
-// ERROR HANDLING
-// ================================
-
 #[error_code]
 pub enum StakingError {
     #[msg("Invalid multiplier value (must be 1-500)")]
@@ -1042,12 +995,6 @@ pub enum StakingError {
     #[msg("Invalid token account")]
     InvalidTokenAccount,
 }
-
-// ================================
-// HELPER FUNCTIONS
-// ================================
-
-/// Calculate weekly reward based on stake amount, multiplier, and time
 fn calculate_reward(amount: u64, multiplier: u64, weeks: u64) -> Result<u64> {
     let annual_reward = amount
         .checked_mul(multiplier)
@@ -1064,7 +1011,6 @@ fn calculate_reward(amount: u64, multiplier: u64, weeks: u64) -> Result<u64> {
         .ok_or(StakingError::CalculationOverflow.into())
 }
 
-/// Validate staking tier parameters
 pub fn validate_tier_params(multiplier: u64, min_duration: u8, max_duration: u8) -> Result<()> {
     require!(
         multiplier > 0 && multiplier <= 500,
@@ -1078,7 +1024,6 @@ pub fn validate_tier_params(multiplier: u64, min_duration: u8, max_duration: u8)
     Ok(())
 }
 
-/// Calculate penalty amount for early unstaking
 pub fn calculate_early_unstake_penalty(
     amount: u64,
     is_locked: bool,
@@ -1095,7 +1040,6 @@ pub fn calculate_early_unstake_penalty(
         .ok_or(StakingError::CalculationOverflow.into())
 }
 
-/// Validate reward distribution percentages
 pub fn validate_reward_distribution() -> Result<()> {
     let total =
         REWARD_DISTRIBUTION_REFERRAL + REWARD_DISTRIBUTION_CASHBACK + REWARD_DISTRIBUTION_STAKING;
@@ -1104,7 +1048,6 @@ pub fn validate_reward_distribution() -> Result<()> {
     Ok(())
 }
 
-/// Calculate unlock timestamp based on duration
 pub fn calculate_unlock_timestamp(start: i64, duration_months: u8) -> Result<i64> {
     let duration_seconds = (duration_months as i64)
         .checked_mul(30 * 24 * 60 * 60)
@@ -1115,17 +1058,14 @@ pub fn calculate_unlock_timestamp(start: i64, duration_months: u8) -> Result<i64
         .ok_or(StakingError::CalculationOverflow.into())
 }
 
-/// Check if enough time has passed for reward claim
 pub fn can_claim_rewards(last_claim: i64, current_time: i64) -> bool {
     current_time >= last_claim + WEEK_IN_SECONDS
 }
 
-/// Check if vesting period is complete
 pub fn is_vesting_complete(vest_timestamp: i64, current_time: i64) -> bool {
     current_time >= vest_timestamp
 }
 
-/// Calculate maximum reward per week based on APY cap
 pub fn calculate_max_weekly_reward(stake_amount: u64) -> Result<u64> {
     stake_amount
         .checked_mul(MAX_APY)
@@ -1134,7 +1074,6 @@ pub fn calculate_max_weekly_reward(stake_amount: u64) -> Result<u64> {
         .ok_or(StakingError::CalculationOverflow.into())
 }
 
-/// Validate token account ownership and mint
 pub fn validate_token_account(
     token_account: &TokenAccount,
     expected_owner: &Pubkey,
@@ -1151,13 +1090,11 @@ pub fn validate_token_account(
     Ok(())
 }
 
-/// Prevent reentrancy attacks by checking program state
 pub fn prevent_reentrancy(program_state: &ProgramState) -> Result<()> {
     require!(!program_state.is_paused, StakingError::ProgramPaused);
     Ok(())
 }
 
-/// Rate limiting helper for sensitive operations
 pub fn check_rate_limit(last_action_time: i64, current_time: i64, min_interval: i64) -> Result<()> {
     require!(
         current_time >= last_action_time + min_interval,
@@ -1166,7 +1103,6 @@ pub fn check_rate_limit(last_action_time: i64, current_time: i64, min_interval: 
     Ok(())
 }
 
-/// Validate admin permissions
 pub fn validate_admin(program_state: &ProgramState, signer: &Pubkey) -> Result<()> {
     require!(program_state.admin == *signer, StakingError::Unauthorized);
     Ok(())

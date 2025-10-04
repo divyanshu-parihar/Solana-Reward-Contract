@@ -35,10 +35,14 @@ async function main() {
 
   const admin = walletKeypair.publicKey;
   const treasury = Keypair.generate();
-  
+  const referralPool = Keypair.generate();
+  const cashbackPool = Keypair.generate();
+
   console.log("🔑 Keypairs:");
   console.log(`   Admin: ${admin.toString()}`);
-  console.log(`   Treasury: ${treasury.toString()}\n`);
+  console.log(`   Treasury: ${treasury.toString()}`);
+  console.log(`   Referral Pool: ${referralPool.publicKey.toString()}`);
+  console.log(`   Cashback Pool: ${cashbackPool.publicKey.toString()}\n`);
 
   try {
     // Step 1: Create reward token mint
@@ -94,17 +98,63 @@ async function main() {
     );
     console.log(`   ✅ Minted 1,000,000 tokens\n`);
 
-    // Step 5: Save deployment info
+    // Step 4: Create referral and cashback pool token accounts
+    console.log("4️⃣ Creating referral and cashback pool token accounts...");
+    const referralPoolAta = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      walletKeypair,
+      tokenMint,
+      referralPool.publicKey,
+      false
+    );
+    const cashbackPoolAta = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      walletKeypair,
+      tokenMint,
+      cashbackPool.publicKey,
+      false
+    );
+    console.log(`   ✅ Referral Pool ATA: ${referralPoolAta.address.toString()}`);
+    console.log(`   ✅ Cashback Pool ATA: ${cashbackPoolAta.address.toString()}\n`);
+
+    // Step 5: Initialize the program
+    console.log("5️⃣ Initializing the program...");
+    const program = anchor.workspace.StakingRewardsContract;
+
+    await program.methods
+      .initialize(
+        admin,
+        tokenMint,
+        treasury.publicKey,
+        referralPool.publicKey,
+        cashbackPool.publicKey
+      )
+      .accounts({
+        programState: programState,
+        programVault: programVault,
+        admin: admin,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([walletKeypair])
+      .rpc();
+
+    console.log(`   ✅ Program initialized successfully\n`);
+
+    // Step 6: Save deployment info
     const deploymentInfo = {
       network: "testnet",
       programId: programId.toString(),
       admin: admin.toString(),
       treasury: treasury.publicKey.toString(),
+      referralPool: referralPool.publicKey.toString(),
+      cashbackPool: cashbackPool.publicKey.toString(),
       tokenMint: tokenMint.toString(),
       programState: programState.toString(),
       programVault: programVault.toString(),
       stakingTier: stakingTier.toString(),
       programVaultTokenAccount: programVaultAta.address.toString(),
+      referralPoolTokenAccount: referralPoolAta.address.toString(),
+      cashbackPoolTokenAccount: cashbackPoolAta.address.toString(),
       deploymentDate: new Date().toISOString()
     };
 
@@ -113,8 +163,8 @@ async function main() {
 
     console.log("💾 Deployment info saved to: deployments/testnet-deployment.json\n");
 
-    // Step 6: Verify deployment
-    console.log("4️⃣ Verifying deployment...");
+    // Step 7: Verify deployment
+    console.log("6️⃣ Verifying deployment...");
     const vaultBalance = await getAccount(provider.connection, programVaultAta.address);
 
     console.log("📊 Deployment Summary:");

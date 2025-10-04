@@ -26,6 +26,8 @@ describe("staking-rewards-contract", () => {
   let user: anchor.web3.Keypair;
   let user2: anchor.web3.Keypair;
   let treasury: anchor.web3.Keypair;
+  let referralPool: anchor.web3.Keypair;
+  let cashbackPool: anchor.web3.Keypair;
   
   // Token accounts
   let tokenMint: anchor.web3.PublicKey;
@@ -33,6 +35,8 @@ describe("staking-rewards-contract", () => {
   let userTokenAccount: anchor.web3.PublicKey;
   let user2TokenAccount: anchor.web3.PublicKey;
   let treasuryTokenAccount: anchor.web3.PublicKey;
+  let referralPoolTokenAccount: anchor.web3.PublicKey;
+  let cashbackPoolTokenAccount: anchor.web3.PublicKey;
   let programVaultTokenAccount: anchor.web3.PublicKey;
 
   // Program accounts (PDAs)
@@ -42,6 +46,7 @@ describe("staking-rewards-contract", () => {
   let stakingTier: anchor.web3.PublicKey;
   let stakePosition: anchor.web3.PublicKey;
   let rewardNft: anchor.web3.PublicKey;
+  let nftAsset: anchor.web3.Keypair;
 
   // Test constants
   const TIER_ID = 1;
@@ -60,12 +65,16 @@ describe("staking-rewards-contract", () => {
       user = anchor.web3.Keypair.generate();
       user2 = anchor.web3.Keypair.generate();
       treasury = anchor.web3.Keypair.generate();
+      referralPool = anchor.web3.Keypair.generate();
+      cashbackPool = anchor.web3.Keypair.generate();
 
       console.log("🔑 Generated keypairs successfully");
       console.log("Admin:", admin.publicKey.toString());
       console.log("User:", user.publicKey.toString());
       console.log("User2:", user2.publicKey.toString());
       console.log("Treasury:", treasury.publicKey.toString());
+      console.log("Referral Pool:", referralPool.publicKey.toString());
+      console.log("Cashback Pool:", cashbackPool.publicKey.toString());
 
       // Airdrop SOL to accounts
       console.log("💰 Requesting airdrops...");
@@ -75,6 +84,8 @@ describe("staking-rewards-contract", () => {
         provider.connection.requestAirdrop(user.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
         provider.connection.requestAirdrop(user2.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
         provider.connection.requestAirdrop(treasury.publicKey, 5 * anchor.web3.LAMPORTS_PER_SOL),
+        provider.connection.requestAirdrop(referralPool.publicKey, 5 * anchor.web3.LAMPORTS_PER_SOL),
+        provider.connection.requestAirdrop(cashbackPool.publicKey, 5 * anchor.web3.LAMPORTS_PER_SOL),
       ]);
 
       await Promise.all(
@@ -139,6 +150,10 @@ describe("staking-rewards-contract", () => {
       );
       console.log("Reward NFT PDA:", rewardNft.toString());
 
+      // Create a keypair for the NFT asset
+      nftAsset = anchor.web3.Keypair.generate();
+      console.log("NFT Asset:", nftAsset.publicKey.toString());
+
       // Create token accounts
       console.log("📦 Creating token accounts...");
       
@@ -177,6 +192,24 @@ describe("staking-rewards-contract", () => {
       );
       treasuryTokenAccount = treasuryAta.address;
       console.log("Treasury token account:", treasuryTokenAccount.toString());
+
+      const referralPoolAta = await getOrCreateAssociatedTokenAccount(
+        provider.connection,
+        referralPool,
+        tokenMint,
+        referralPool.publicKey
+      );
+      referralPoolTokenAccount = referralPoolAta.address;
+      console.log("Referral pool token account:", referralPoolTokenAccount.toString());
+
+      const cashbackPoolAta = await getOrCreateAssociatedTokenAccount(
+        provider.connection,
+        cashbackPool,
+        tokenMint,
+        cashbackPool.publicKey
+      );
+      cashbackPoolTokenAccount = cashbackPoolAta.address;
+      console.log("Cashback pool token account:", cashbackPoolTokenAccount.toString());
 
       // Mint tokens to accounts
       console.log("💸 Minting tokens...");
@@ -225,7 +258,9 @@ describe("staking-rewards-contract", () => {
         .initialize(
           admin.publicKey,
           tokenMint,
-          treasury.publicKey
+          treasury.publicKey,
+          referralPool.publicKey,
+          cashbackPool.publicKey
         )
         .accounts({
           programState: programState,
@@ -265,6 +300,8 @@ describe("staking-rewards-contract", () => {
       assert.equal(programStateAccount.admin.toString(), admin.publicKey.toString());
       assert.equal(programStateAccount.rewardTokenMint.toString(), tokenMint.toString());
       assert.equal(programStateAccount.protocolTreasury.toString(), treasury.publicKey.toString());
+      assert.equal(programStateAccount.referralPool.toString(), referralPool.publicKey.toString());
+      assert.equal(programStateAccount.cashbackPool.toString(), cashbackPool.publicKey.toString());
       assert.equal(programStateAccount.currentEpoch.toNumber(), 0);
       assert.equal(programStateAccount.totalStaked.toNumber(), 0);
       assert.equal(programStateAccount.rewardPool.toNumber(), 0);
@@ -282,7 +319,9 @@ describe("staking-rewards-contract", () => {
           .initialize(
             admin.publicKey,
             tokenMint,
-            treasury.publicKey
+            treasury.publicKey,
+            referralPool.publicKey,
+            cashbackPool.publicKey
           )
           .accounts({
             programState: programState,
@@ -776,7 +815,12 @@ describe("staking-rewards-contract", () => {
           .distributeWeeklyRewards(totalRewards)
           .accounts({
             programState: programState,
+            programVault: programVault,
+            programVaultTokenAccount: programVaultTokenAccount,
+            referralPoolTokenAccount: referralPoolTokenAccount,
+            cashbackPoolTokenAccount: cashbackPoolTokenAccount,
             admin: admin.publicKey,
+            tokenProgram: TOKEN_PROGRAM_ID,
           })
           .signers([admin])
           .rpc();
@@ -786,10 +830,21 @@ describe("staking-rewards-contract", () => {
         // Verify program state updated
         const programStateAccount = await program.account.programState.fetch(programState);
         const expectedStakingAmount = totalRewards.toNumber() * 40 / 100; // 40% to staking pool
-        
+
         // Should have added staking portion to reward pool
         assert(programStateAccount.rewardPool.toNumber() >= initialRewardPool.toNumber() + expectedStakingAmount);
         assert.equal(programStateAccount.currentEpoch.toNumber(), initialEpoch.toNumber() + 1);
+
+        // Check if referral and cashback pools received funds
+        const referralPoolBalance = await getAccount(provider.connection, referralPoolTokenAccount);
+        const cashbackPoolBalance = await getAccount(provider.connection, cashbackPoolTokenAccount);
+
+        const expectedReferralAmount = totalRewards.toNumber() * 30 / 100; // 30% to referral
+        const expectedCashbackAmount = totalRewards.toNumber() * 30 / 100; // 30% to cashback
+
+        assert.equal(referralPoolBalance.amount.toString(), expectedReferralAmount.toString());
+        assert.equal(cashbackPoolBalance.amount.toString(), expectedCashbackAmount.toString());
+        console.log("✅ Referral and cashback pools received correct amounts");
       } catch (error) {
         // Expected to fail if not enough time has passed
         expect(error.message || error.toString()).to.contain("EpochNotReady");
@@ -799,18 +854,24 @@ describe("staking-rewards-contract", () => {
 
     it("Should fail to claim rewards too early", async () => {
       try {
+        const MPL_CORE_PROGRAM_ID = new anchor.web3.PublicKey("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
+        const testNftAsset = anchor.web3.Keypair.generate();
+
         await program.methods
           .claimRewards(POSITION_SEED, NFT_SEED)
           .accounts({
             stakePosition: stakePosition,
             staker: user.publicKey,
             rewardNft: rewardNft,
+            nftAsset: testNftAsset.publicKey,
+            assetOwner: user.publicKey,
             programState: programState,
             systemProgram: anchor.web3.SystemProgram.programId,
+            mplCoreProgram: MPL_CORE_PROGRAM_ID,
           })
           .signers([user])
           .rpc();
-        
+
         assert.fail("Should have failed");
       } catch (error) {
         expect(error.message || error.toString()).to.contain("RewardNotReady");
@@ -1270,6 +1331,8 @@ describe("staking-rewards-contract", () => {
       assert.equal(programStateAccount.admin.toString(), admin.publicKey.toString());
       assert.equal(programStateAccount.rewardTokenMint.toString(), tokenMint.toString());
       assert.equal(programStateAccount.protocolTreasury.toString(), treasury.publicKey.toString());
+      assert.equal(programStateAccount.referralPool.toString(), referralPool.publicKey.toString());
+      assert.equal(programStateAccount.cashbackPool.toString(), cashbackPool.publicKey.toString());
       assert(programStateAccount.currentEpoch.toNumber() >= 0);
       assert(programStateAccount.totalStaked.toNumber() >= 0);
       assert(programStateAccount.rewardPool.toNumber() >= 0);
@@ -1307,6 +1370,8 @@ describe("staking-rewards-contract", () => {
       assert.equal(programStateAccount.admin.toString(), admin.publicKey.toString());
       assert.equal(programStateAccount.rewardTokenMint.toString(), tokenMint.toString());
       assert.equal(programStateAccount.protocolTreasury.toString(), treasury.publicKey.toString());
+      assert.equal(programStateAccount.referralPool.toString(), referralPool.publicKey.toString());
+      assert.equal(programStateAccount.cashbackPool.toString(), cashbackPool.publicKey.toString());
       assert(programStateAccount.currentEpoch.toNumber() >= 0);
       assert(programStateAccount.totalStaked.toNumber() >= 0);
       assert(programStateAccount.rewardPool.toNumber() >= 0);

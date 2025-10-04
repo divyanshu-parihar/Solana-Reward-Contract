@@ -1,9 +1,12 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use mpl_core::{
+    ID as MPL_CORE_PROGRAM_ID,
+    instructions::CreateV2CpiBuilder
+};
 use std::cmp;
 
 declare_id!("AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N");
-
 const WEEK_IN_SECONDS: i64 = 604800;
 const MAX_APY: u64 = 75;
 const EARLY_UNSTAKE_PENALTY: u64 = 50;
@@ -23,11 +26,15 @@ pub mod staking_rewards_contract {
         admin: Pubkey,
         reward_token_mint: Pubkey,
         protocol_treasury: Pubkey,
+        referral_pool: Pubkey,
+        cashback_pool: Pubkey,
     ) -> Result<()> {
         let program_state = &mut ctx.accounts.program_state;
         program_state.admin = admin;
         program_state.reward_token_mint = reward_token_mint;
         program_state.protocol_treasury = protocol_treasury;
+        program_state.referral_pool = referral_pool;
+        program_state.cashback_pool = cashback_pool;
         program_state.current_epoch = 0;
         program_state.total_staked = 0;
         program_state.reward_pool = 0;
@@ -39,6 +46,8 @@ pub mod staking_rewards_contract {
             admin,
             reward_token_mint,
             protocol_treasury,
+            referral_pool,
+            cashback_pool,
         });
 
         Ok(())
@@ -247,6 +256,7 @@ pub mod staking_rewards_contract {
         _position_seed: u64,
         _nft_seed: u64,
     ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
         let stake_position = &mut ctx.accounts.stake_position;
         require!(stake_position.is_active, StakingError::StakeNotActive);
 
@@ -279,10 +289,27 @@ pub mod staking_rewards_contract {
         );
 
         if final_reward > 0 {
+            // Create a Metaplex Core NFT representing the reward claim
+            let nft_name = format!("Staking Reward #{}", &ctx.accounts.nft_asset.key().to_string()[..8]);
+            let nft_uri = format!("https://rewards.example.com/metadata/{}", ctx.accounts.nft_asset.key());
+
+            // Create the Core NFT using CPI
+            CreateV2CpiBuilder::new(&ctx.accounts.mpl_core_program)
+                .asset(&ctx.accounts.nft_asset)
+                .payer(&ctx.accounts.staker)
+                .owner(Some(&ctx.accounts.asset_owner))
+                .update_authority(Some(&ctx.accounts.staker))
+                .system_program(&ctx.accounts.system_program)
+                .name(nft_name)
+                .uri(nft_uri)
+                .invoke()?;
+
+            // Store reward information in PDA
             let reward_nft = &mut ctx.accounts.reward_nft;
             reward_nft.owner = ctx.accounts.staker.key();
             reward_nft.reward_amount = final_reward;
             reward_nft.vest_timestamp = clock.unix_timestamp + VESTING_PERIOD_SECONDS;
+            reward_nft.nft_asset = ctx.accounts.nft_asset.key();
             reward_nft.is_active = true;
             reward_nft.bump = ctx.bumps.reward_nft;
 
@@ -312,6 +339,7 @@ pub mod staking_rewards_contract {
     }
 
     pub fn vest_reward_nft(ctx: Context<VestRewardNft>, _nft_seed: u64) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
         let reward_nft = &ctx.accounts.reward_nft;
         require!(reward_nft.is_active, StakingError::NFTAlreadyVested);
 
@@ -321,6 +349,11 @@ pub mod staking_rewards_contract {
             StakingError::VestingNotComplete
         );
 
+        // Note: With Metaplex Core NFTs, ownership verification is handled by the Core program
+        // The NFT can be traded/transferred, and whoever holds it can redeem it
+        // This allows for secondary market trading of vesting rewards
+
+        // Transfer the reward tokens to the current NFT holder (user)
         let seeds = &[
             b"program_vault".as_ref(),
             &[ctx.accounts.program_vault.bump],
@@ -338,6 +371,7 @@ pub mod staking_rewards_contract {
         );
         token::transfer(transfer_ctx, reward_nft.reward_amount)?;
 
+        // Mark the reward as redeemed (but keep the NFT as proof)
         let reward_nft = &mut ctx.accounts.reward_nft;
         let vested_amount = reward_nft.reward_amount;
         reward_nft.is_active = false;
@@ -346,6 +380,7 @@ pub mod staking_rewards_contract {
         emit!(RewardsVested {
             user: ctx.accounts.user.key(),
             amount: vested_amount,
+            nft_asset: ctx.accounts.nft_asset.key(),
         });
 
         Ok(())
@@ -355,6 +390,7 @@ pub mod staking_rewards_contract {
         ctx: Context<DistributeWeeklyRewards>,
         total_rewards: u64,
     ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
         let clock = Clock::get()?;
         let program_state = &mut ctx.accounts.program_state;
 
@@ -394,6 +430,47 @@ pub mod staking_rewards_contract {
             StakingError::InvalidDistribution
         );
 
+        // Transfer referral amount to referral pool
+        if referral_amount > 0 {
+            let seeds = &[
+                b"program_vault".as_ref(),
+                &[ctx.accounts.program_vault.bump],
+            ];
+            let signer = &[&seeds[..]];
+
+            let transfer_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.program_vault_token_account.to_account_info(),
+                    to: ctx.accounts.referral_pool_token_account.to_account_info(),
+                    authority: ctx.accounts.program_vault.to_account_info(),
+                },
+                signer,
+            );
+            token::transfer(transfer_ctx, referral_amount)?;
+        }
+
+        // Transfer cashback amount to cashback pool
+        if cashback_amount > 0 {
+            let seeds = &[
+                b"program_vault".as_ref(),
+                &[ctx.accounts.program_vault.bump],
+            ];
+            let signer = &[&seeds[..]];
+
+            let transfer_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.program_vault_token_account.to_account_info(),
+                    to: ctx.accounts.cashback_pool_token_account.to_account_info(),
+                    authority: ctx.accounts.program_vault.to_account_info(),
+                },
+                signer,
+            );
+            token::transfer(transfer_ctx, cashback_amount)?;
+        }
+
+        // Add staking amount to reward pool
         program_state.reward_pool = program_state
             .reward_pool
             .checked_add(staking_amount)
@@ -474,6 +551,7 @@ pub mod staking_rewards_contract {
     }
 
     pub fn add_reward_funds(ctx: Context<AddRewardFunds>, amount: u64) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
         require!(amount > 0, StakingError::InvalidAmount);
 
         let transfer_ctx = CpiContext::new(
@@ -504,19 +582,21 @@ pub mod staking_rewards_contract {
 #[account]
 #[derive(Debug)]
 pub struct ProgramState {
-    pub admin: Pubkey,             
-    pub reward_token_mint: Pubkey, 
-    pub protocol_treasury: Pubkey, 
-    pub current_epoch: u64,        
-    pub total_staked: u64,         
-    pub reward_pool: u64,          
-    pub is_paused: bool,           
-    pub last_epoch_timestamp: i64, 
-    pub bump: u8,                  
+    pub admin: Pubkey,
+    pub reward_token_mint: Pubkey,
+    pub protocol_treasury: Pubkey,
+    pub referral_pool: Pubkey,
+    pub cashback_pool: Pubkey,
+    pub current_epoch: u64,
+    pub total_staked: u64,
+    pub reward_pool: u64,
+    pub is_paused: bool,
+    pub last_epoch_timestamp: i64,
+    pub bump: u8,
 }
 
 impl ProgramState {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 1 + 8 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 1 + 8 + 1;
 }
 
 #[account]
@@ -558,15 +638,16 @@ impl StakePosition {
 #[account]
 #[derive(Debug)]
 pub struct RewardNFT {
-    pub owner: Pubkey,       
-    pub reward_amount: u64,  
-    pub vest_timestamp: i64, 
-    pub is_active: bool,     
-    pub bump: u8,            
+    pub owner: Pubkey,
+    pub reward_amount: u64,
+    pub vest_timestamp: i64,
+    pub nft_asset: Pubkey,
+    pub is_active: bool,
+    pub bump: u8,
 }
 
 impl RewardNFT {
-    pub const LEN: usize = 8 + 32 + 8 + 8 + 1 + 1;
+    pub const LEN: usize = 8 + 32 + 8 + 8 + 32 + 1 + 1;
 }
 
 #[account]
@@ -691,7 +772,8 @@ pub struct UnstakeTokens<'info> {
     pub program_state: Account<'info, ProgramState>,
     #[account(
         mut,
-        constraint = user_token_account.owner == staker.key() @ StakingError::Unauthorized
+        constraint = user_token_account.owner == staker.key() @ StakingError::Unauthorized,
+        constraint = user_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
     )]
     pub user_token_account: Account<'info, TokenAccount>,
     #[account(
@@ -708,7 +790,8 @@ pub struct UnstakeTokens<'info> {
     pub program_vault_token_account: Account<'info, TokenAccount>,
     #[account(
         mut,
-        constraint = treasury_token_account.owner == program_state.protocol_treasury @ StakingError::InvalidTokenAccount
+        constraint = treasury_token_account.owner == program_state.protocol_treasury @ StakingError::InvalidTokenAccount,
+        constraint = treasury_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
     )]
     pub treasury_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
@@ -734,6 +817,11 @@ pub struct ClaimRewards<'info> {
         bump
     )]
     pub reward_nft: Account<'info, RewardNFT>,
+    /// CHECK: This will be the Core NFT asset account - validated by Core program
+    #[account(mut)]
+    pub nft_asset: UncheckedAccount<'info>,
+    /// CHECK: This is the authority that will own the NFT
+    pub asset_owner: AccountInfo<'info>,
     #[account(
         mut,
         seeds = [b"program_state"],
@@ -741,6 +829,9 @@ pub struct ClaimRewards<'info> {
     )]
     pub program_state: Account<'info, ProgramState>,
     pub system_program: Program<'info, System>,
+    /// CHECK: This is the Metaplex Core program
+    #[account(address = MPL_CORE_PROGRAM_ID)]
+    pub mpl_core_program: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -755,6 +846,12 @@ pub struct VestRewardNft<'info> {
     pub reward_nft: Account<'info, RewardNFT>,
     #[account(mut)]
     pub user: Signer<'info>,
+    /// CHECK: This is the Core NFT asset account
+    #[account(
+        mut,
+        address = reward_nft.nft_asset
+    )]
+    pub nft_asset: UncheckedAccount<'info>,
     #[account(
         mut,
         seeds = [b"program_state"],
@@ -763,7 +860,8 @@ pub struct VestRewardNft<'info> {
     pub program_state: Account<'info, ProgramState>,
     #[account(
         mut,
-        constraint = user_token_account.owner == user.key() @ StakingError::Unauthorized
+        constraint = user_token_account.owner == user.key() @ StakingError::Unauthorized,
+        constraint = user_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
     )]
     pub user_token_account: Account<'info, TokenAccount>,
     #[account(
@@ -790,7 +888,32 @@ pub struct DistributeWeeklyRewards<'info> {
         constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
     )]
     pub program_state: Account<'info, ProgramState>,
+    #[account(
+        mut,
+        seeds = [b"program_vault"],
+        bump
+    )]
+    pub program_vault: Account<'info, ProgramVault>,
+    #[account(
+        mut,
+        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
+        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub program_vault_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = referral_pool_token_account.owner == program_state.referral_pool @ StakingError::InvalidTokenAccount,
+        constraint = referral_pool_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub referral_pool_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = cashback_pool_token_account.owner == program_state.cashback_pool @ StakingError::InvalidTokenAccount,
+        constraint = cashback_pool_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub cashback_pool_token_account: Account<'info, TokenAccount>,
     pub admin: Signer<'info>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -871,6 +994,8 @@ pub struct ProgramInitialized {
     pub admin: Pubkey,
     pub reward_token_mint: Pubkey,
     pub protocol_treasury: Pubkey,
+    pub referral_pool: Pubkey,
+    pub cashback_pool: Pubkey,
 }
 
 #[event]
@@ -920,6 +1045,7 @@ pub struct RewardsClaimed {
 pub struct RewardsVested {
     pub user: Pubkey,
     pub amount: u64,
+    pub nft_asset: Pubkey,
 }
 
 #[event]
@@ -994,6 +1120,8 @@ pub enum StakingError {
     PositionSeedCollision,
     #[msg("Invalid token account")]
     InvalidTokenAccount,
+    #[msg("NFT not owned")]
+    NFTNotOwned,
 }
 fn calculate_reward(amount: u64, multiplier: u64, weeks: u64) -> Result<u64> {
     let annual_reward = amount

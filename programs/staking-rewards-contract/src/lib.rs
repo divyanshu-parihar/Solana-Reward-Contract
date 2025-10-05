@@ -94,7 +94,7 @@ pub mod staking_rewards_contract {
             StakingError::InvalidAmount
         );
         require!(
-            duration_months >= 1 && duration_months <= 36,
+            duration_months >= 1,
             StakingError::InvalidDuration
         );
 
@@ -349,9 +349,43 @@ pub mod staking_rewards_contract {
             StakingError::VestingNotComplete
         );
 
-        // Note: With Metaplex Core NFTs, ownership verification is handled by the Core program
-        // The NFT can be traded/transferred, and whoever holds it can redeem it
-        // This allows for secondary market trading of vesting rewards
+        // Verify NFT ownership through Core program
+        // The Core NFT asset account must have the correct owner (user)
+        let nft_asset_info = &ctx.accounts.nft_asset;
+
+        // Verify the NFT asset account matches the one in our RewardNFT PDA
+        require!(
+            nft_asset_info.key() == reward_nft.nft_asset,
+            StakingError::InvalidNFTAsset
+        );
+
+        // Enhanced NFT ownership verification with safety checks
+        let asset_data = nft_asset_info.try_borrow_data()?;
+
+        // Verify minimum account size (discriminator + owner + basic fields)
+        require!(asset_data.len() >= 40, StakingError::InvalidNFTAsset);
+
+        // Verify this is actually a Core asset by checking discriminator
+        // Core Asset discriminator: [232, 219, 223, 41, 219, 236, 220, 190]
+        let expected_discriminator = [232, 219, 223, 41, 219, 236, 220, 190];
+        let account_discriminator = &asset_data[0..8];
+        require!(
+            account_discriminator == expected_discriminator,
+            StakingError::InvalidNFTAsset
+        );
+
+        // Extract owner from Core NFT account data (offset 8-40)
+        let owner_bytes = &asset_data[8..40];
+        let current_owner = Pubkey::new_from_array(
+            owner_bytes.try_into()
+                .map_err(|_| StakingError::InvalidNFTAsset)?
+        );
+
+        // Verify the user is the current owner of the NFT
+        require!(
+            current_owner == ctx.accounts.user.key(),
+            StakingError::NFTNotOwned
+        );
 
         // Transfer the reward tokens to the current NFT holder (user)
         let seeds = &[
@@ -381,6 +415,32 @@ pub mod staking_rewards_contract {
             user: ctx.accounts.user.key(),
             amount: vested_amount,
             nft_asset: ctx.accounts.nft_asset.key(),
+        });
+
+        Ok(())
+    }
+
+    pub fn transfer_reward_nft(
+        ctx: Context<TransferRewardNft>,
+        _nft_seed: u64,
+    ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+
+        // This instruction enables NFT transfers while preserving redemption rights
+        // The Core program handles the actual transfer
+        // The RewardNFT PDA remains linked to the original NFT asset
+        // Whoever owns the NFT can redeem the rewards when vesting period completes
+
+        let reward_nft = &ctx.accounts.reward_nft;
+        require!(reward_nft.is_active, StakingError::NFTAlreadyVested);
+
+        // Emit event to track NFT transfers for indexing
+        emit!(RewardNFTTransferred {
+            nft_asset: ctx.accounts.nft_asset.key(),
+            from: ctx.accounts.from.key(),
+            to: ctx.accounts.to.key(),
+            reward_amount: reward_nft.reward_amount,
+            vest_timestamp: reward_nft.vest_timestamp,
         });
 
         Ok(())
@@ -578,6 +638,176 @@ pub mod staking_rewards_contract {
 
         Ok(())
     }
+
+    pub fn claim_referral_rewards(
+        ctx: Context<ClaimReferralRewards>,
+        amount: u64,
+    ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+        require!(amount > 0, StakingError::InvalidAmount);
+
+        let referral_account = &mut ctx.accounts.referral_account;
+        require!(
+            referral_account.available_rewards >= amount,
+            StakingError::InsufficientRewardPool
+        );
+
+        // Transfer referral rewards to user from program vault
+        let seeds = &[
+            b"program_vault".as_ref(),
+            &[ctx.accounts.program_vault.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.program_vault_token_account.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                authority: ctx.accounts.program_vault.to_account_info(),
+            },
+            signer,
+        );
+        token::transfer(transfer_ctx, amount)?;
+
+        // Update referral account
+        referral_account.available_rewards = referral_account
+            .available_rewards
+            .checked_sub(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+        referral_account.total_claimed = referral_account
+            .total_claimed
+            .checked_add(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+
+        emit!(ReferralRewardsClaimed {
+            user: ctx.accounts.user.key(),
+            amount,
+        });
+
+        Ok(())
+    }
+
+    pub fn claim_cashback_rewards(
+        ctx: Context<ClaimCashbackRewards>,
+        amount: u64,
+    ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+        require!(amount > 0, StakingError::InvalidAmount);
+
+        let cashback_account = &mut ctx.accounts.cashback_account;
+        require!(
+            cashback_account.available_rewards >= amount,
+            StakingError::InsufficientRewardPool
+        );
+
+        // Transfer cashback rewards to user from program vault
+        let seeds = &[
+            b"program_vault".as_ref(),
+            &[ctx.accounts.program_vault.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.program_vault_token_account.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                authority: ctx.accounts.program_vault.to_account_info(),
+            },
+            signer,
+        );
+        token::transfer(transfer_ctx, amount)?;
+
+        // Update cashback account
+        cashback_account.available_rewards = cashback_account
+            .available_rewards
+            .checked_sub(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+        cashback_account.total_claimed = cashback_account
+            .total_claimed
+            .checked_add(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+
+        emit!(CashbackRewardsClaimed {
+            user: ctx.accounts.user.key(),
+            amount,
+        });
+
+        Ok(())
+    }
+
+    pub fn add_referral_rewards(
+        ctx: Context<AddReferralRewards>,
+        user: Pubkey,
+        amount: u64,
+    ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+        require!(amount > 0, StakingError::InvalidAmount);
+
+        let referral_account = &mut ctx.accounts.referral_account;
+
+        // Initialize account if needed
+        if referral_account.user == Pubkey::default() {
+            referral_account.user = user;
+            referral_account.available_rewards = 0;
+            referral_account.total_earned = 0;
+            referral_account.total_claimed = 0;
+            referral_account.bump = ctx.bumps.referral_account;
+        }
+
+        referral_account.available_rewards = referral_account
+            .available_rewards
+            .checked_add(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+        referral_account.total_earned = referral_account
+            .total_earned
+            .checked_add(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+
+        emit!(ReferralRewardsAdded {
+            user,
+            amount,
+        });
+
+        Ok(())
+    }
+
+    pub fn add_cashback_rewards(
+        ctx: Context<AddCashbackRewards>,
+        user: Pubkey,
+        amount: u64,
+    ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+        require!(amount > 0, StakingError::InvalidAmount);
+
+        let cashback_account = &mut ctx.accounts.cashback_account;
+
+        // Initialize account if needed
+        if cashback_account.user == Pubkey::default() {
+            cashback_account.user = user;
+            cashback_account.available_rewards = 0;
+            cashback_account.total_earned = 0;
+            cashback_account.total_claimed = 0;
+            cashback_account.bump = ctx.bumps.cashback_account;
+        }
+
+        cashback_account.available_rewards = cashback_account
+            .available_rewards
+            .checked_add(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+        cashback_account.total_earned = cashback_account
+            .total_earned
+            .checked_add(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+
+        emit!(CashbackRewardsAdded {
+            user,
+            amount,
+        });
+
+        Ok(())
+    }
 }
 #[account]
 #[derive(Debug)]
@@ -658,6 +888,34 @@ pub struct ProgramVault {
 
 impl ProgramVault {
     pub const LEN: usize = 8 + 1;
+}
+
+#[account]
+#[derive(Debug)]
+pub struct ReferralAccount {
+    pub user: Pubkey,
+    pub available_rewards: u64,
+    pub total_earned: u64,
+    pub total_claimed: u64,
+    pub bump: u8,
+}
+
+impl ReferralAccount {
+    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 1;
+}
+
+#[account]
+#[derive(Debug)]
+pub struct CashbackAccount {
+    pub user: Pubkey,
+    pub available_rewards: u64,
+    pub total_earned: u64,
+    pub total_claimed: u64,
+    pub bump: u8,
+}
+
+impl CashbackAccount {
+    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 1;
 }
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -839,9 +1097,8 @@ pub struct ClaimRewards<'info> {
 pub struct VestRewardNft<'info> {
     #[account(
         mut,
-        seeds = [b"reward_nft", user.key().as_ref(), &nft_seed.to_le_bytes()],
-        bump,
-        constraint = reward_nft.owner == user.key() @ StakingError::Unauthorized
+        seeds = [b"reward_nft", reward_nft.owner.as_ref(), &nft_seed.to_le_bytes()],
+        bump
     )]
     pub reward_nft: Account<'info, RewardNFT>,
     #[account(mut)]
@@ -989,6 +1246,152 @@ pub struct AddRewardFunds<'info> {
     pub program_vault_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
+
+#[derive(Accounts)]
+#[instruction(nft_seed: u64)]
+pub struct TransferRewardNft<'info> {
+    #[account(
+        seeds = [b"reward_nft", from.key().as_ref(), &nft_seed.to_le_bytes()],
+        bump,
+    )]
+    pub reward_nft: Account<'info, RewardNFT>,
+    /// CHECK: This is the Core NFT asset account
+    #[account(
+        mut,
+        address = reward_nft.nft_asset
+    )]
+    pub nft_asset: UncheckedAccount<'info>,
+    /// CHECK: Current NFT owner (from)
+    pub from: AccountInfo<'info>,
+    /// CHECK: New NFT owner (to)
+    pub to: AccountInfo<'info>,
+    #[account(
+        seeds = [b"program_state"],
+        bump
+    )]
+    pub program_state: Account<'info, ProgramState>,
+    /// CHECK: This is the Metaplex Core program
+    #[account(address = MPL_CORE_PROGRAM_ID)]
+    pub mpl_core_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimReferralRewards<'info> {
+    #[account(
+        mut,
+        seeds = [b"referral_account", user.key().as_ref()],
+        bump = referral_account.bump
+    )]
+    pub referral_account: Account<'info, ReferralAccount>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"program_state"],
+        bump
+    )]
+    pub program_state: Account<'info, ProgramState>,
+    #[account(
+        mut,
+        seeds = [b"program_vault"],
+        bump
+    )]
+    pub program_vault: Account<'info, ProgramVault>,
+    #[account(
+        mut,
+        constraint = user_token_account.owner == user.key() @ StakingError::Unauthorized,
+        constraint = user_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
+        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub program_vault_token_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimCashbackRewards<'info> {
+    #[account(
+        mut,
+        seeds = [b"cashback_account", user.key().as_ref()],
+        bump = cashback_account.bump
+    )]
+    pub cashback_account: Account<'info, CashbackAccount>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"program_state"],
+        bump
+    )]
+    pub program_state: Account<'info, ProgramState>,
+    #[account(
+        mut,
+        seeds = [b"program_vault"],
+        bump
+    )]
+    pub program_vault: Account<'info, ProgramVault>,
+    #[account(
+        mut,
+        constraint = user_token_account.owner == user.key() @ StakingError::Unauthorized,
+        constraint = user_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
+        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
+    )]
+    pub program_vault_token_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+#[instruction(user: Pubkey)]
+pub struct AddReferralRewards<'info> {
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = ReferralAccount::LEN,
+        seeds = [b"referral_account", user.as_ref()],
+        bump
+    )]
+    pub referral_account: Account<'info, ReferralAccount>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(
+        seeds = [b"program_state"],
+        bump,
+        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
+    )]
+    pub program_state: Account<'info, ProgramState>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(user: Pubkey)]
+pub struct AddCashbackRewards<'info> {
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = CashbackAccount::LEN,
+        seeds = [b"cashback_account", user.as_ref()],
+        bump
+    )]
+    pub cashback_account: Account<'info, CashbackAccount>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(
+        seeds = [b"program_state"],
+        bump,
+        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
+    )]
+    pub program_state: Account<'info, ProgramState>,
+    pub system_program: Program<'info, System>,
+}
 #[event]
 pub struct ProgramInitialized {
     pub admin: Pubkey,
@@ -1078,14 +1481,45 @@ pub struct RewardFundsAdded {
     pub admin: Pubkey,
     pub amount: u64,
 }
+
+#[event]
+pub struct RewardNFTTransferred {
+    pub nft_asset: Pubkey,
+    pub from: Pubkey,
+    pub to: Pubkey,
+    pub reward_amount: u64,
+    pub vest_timestamp: i64,
+}
+
+#[event]
+pub struct ReferralRewardsClaimed {
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct CashbackRewardsClaimed {
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct ReferralRewardsAdded {
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct CashbackRewardsAdded {
+    pub user: Pubkey,
+    pub amount: u64,
+}
 #[error_code]
 pub enum StakingError {
     #[msg("Invalid multiplier value (must be 1-500)")]
     InvalidMultiplier,
     #[msg("Invalid duration")]
     InvalidDuration,
-    #[msg("Duration too long (max 36 months)")]
-    ExcessiveDuration,
     #[msg("Invalid amount")]
     InvalidAmount,
     #[msg("Staking tier not active")]
@@ -1122,6 +1556,8 @@ pub enum StakingError {
     InvalidTokenAccount,
     #[msg("NFT not owned")]
     NFTNotOwned,
+    #[msg("Invalid NFT asset")]
+    InvalidNFTAsset,
 }
 fn calculate_reward(amount: u64, multiplier: u64, weeks: u64) -> Result<u64> {
     let annual_reward = amount
@@ -1148,7 +1584,6 @@ pub fn validate_tier_params(multiplier: u64, min_duration: u8, max_duration: u8)
         min_duration > 0 && min_duration <= max_duration,
         StakingError::InvalidDuration
     );
-    require!(max_duration <= 36, StakingError::ExcessiveDuration);
     Ok(())
 }
 

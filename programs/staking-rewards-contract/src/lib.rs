@@ -1,8 +1,5 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-// ✅ Token Extensions ready (uncomment when needed)
-// use anchor_spl::token_2022::{self, Token2022};
-// use anchor_spl::token_interface::{Mint, TokenAccount as TokenAccount2022};
 use mpl_core::{
     ID as MPL_CORE_PROGRAM_ID,
     instructions::CreateV2CpiBuilder
@@ -12,16 +9,16 @@ use std::cmp;
 declare_id!("9zbbGQ1crgrG9dj7UXCTbx9JkXm522fg7AprTwSBHoa6");
 
 // ========== FIXED CONSTANTS ==========
-const WEEK_IN_SECONDS: i64 = 604800;  // 7 days ✅
-const VESTING_PERIOD_SECONDS: i64 = 365 * 24 * 60 * 60;  // ✅ 1 YEAR (not 30 days)
-const WEEKLY_EMISSION_RATE: u64 = 21;  // ✅ 0.21% = 21/10000
-const EMISSION_PRECISION: u64 = 10000;  // For 0.21% precision
-const REWARD_PENALTY_PERCENT: u64 = 100;  // ✅ 100% penalty on REWARDS only
+const WEEK_IN_SECONDS: i64 = 604800; 
+const VESTING_PERIOD_SECONDS: i64 = 365 * 24 * 60 * 60; 
+const WEEKLY_EMISSION_RATE: u64 = 21;  
+const EMISSION_PRECISION: u64 = 10000;  
+const REWARD_PENALTY_PERCENT: u64 = 100; 
 const MIN_STAKE_AMOUNT: u64 = 1_000_000;
 const MAX_STAKE_AMOUNT: u64 = 1_000_000_000_000_000;
 
 // Power multiplier constants
-const BASE_MULTIPLIER: u64 = 100;  // 1.0x in basis points
+const BASE_MULTIPLIER: u64 = 100;  
 
 #[program]
 pub mod staking_rewards_contract {

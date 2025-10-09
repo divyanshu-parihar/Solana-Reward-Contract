@@ -3,7 +3,10 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-staking_rewards_contract = "AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N"
+staking_rewards_contract = "9zbbGQ1crgrG9dj7UXCTbx9JkXm522fg7AprTwSBHoa6"
+
+[programs.devnet]
+staking_rewards_contract = "9zbbGQ1crgrG9dj7UXCTbx9JkXm522fg7AprTwSBHoa6"
 
 [registry]
 url = "https://api.apr.dev"

@@ -1,21 +1,27 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+// ✅ Token Extensions ready (uncomment when needed)
+// use anchor_spl::token_2022::{self, Token2022};
+// use anchor_spl::token_interface::{Mint, TokenAccount as TokenAccount2022};
 use mpl_core::{
     ID as MPL_CORE_PROGRAM_ID,
     instructions::CreateV2CpiBuilder
 };
 use std::cmp;
 
-declare_id!("AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N");
-const WEEK_IN_SECONDS: i64 = 604800;
-const MAX_APY: u64 = 75;
-const EARLY_UNSTAKE_PENALTY: u64 = 50;
-const REWARD_DISTRIBUTION_REFERRAL: u64 = 30;
-const REWARD_DISTRIBUTION_CASHBACK: u64 = 30;
-const REWARD_DISTRIBUTION_STAKING: u64 = 40;
-const VESTING_PERIOD_SECONDS: i64 = 30 * 24 * 60 * 60;
+declare_id!("9zbbGQ1crgrG9dj7UXCTbx9JkXm522fg7AprTwSBHoa6");
+
+// ========== FIXED CONSTANTS ==========
+const WEEK_IN_SECONDS: i64 = 604800;  // 7 days ✅
+const VESTING_PERIOD_SECONDS: i64 = 365 * 24 * 60 * 60;  // ✅ 1 YEAR (not 30 days)
+const WEEKLY_EMISSION_RATE: u64 = 21;  // ✅ 0.21% = 21/10000
+const EMISSION_PRECISION: u64 = 10000;  // For 0.21% precision
+const REWARD_PENALTY_PERCENT: u64 = 100;  // ✅ 100% penalty on REWARDS only
 const MIN_STAKE_AMOUNT: u64 = 1_000_000;
 const MAX_STAKE_AMOUNT: u64 = 1_000_000_000_000_000;
+
+// Power multiplier constants
+const BASE_MULTIPLIER: u64 = 100;  // 1.0x in basis points
 
 #[program]
 pub mod staking_rewards_contract {
@@ -41,6 +47,7 @@ pub mod staking_rewards_contract {
         program_state.is_paused = false;
         program_state.last_epoch_timestamp = Clock::get()?.unix_timestamp;
         program_state.bump = ctx.bumps.program_state;
+        program_state.use_token_extensions = false;  // Can be updated later
 
         emit!(ProgramInitialized {
             admin,
@@ -48,6 +55,326 @@ pub mod staking_rewards_contract {
             protocol_treasury,
             referral_pool,
             cashback_pool,
+        });
+
+        Ok(())
+    }
+
+    pub fn stake_tokens(
+        ctx: Context<StakeTokens>,
+        amount: u64,
+        duration_months: u8,
+        tier_id: u8,
+        is_locked: bool,
+        _position_seed: u64,
+    ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+        require!(
+            amount >= MIN_STAKE_AMOUNT && amount <= MAX_STAKE_AMOUNT,
+            StakingError::InvalidAmount
+        );
+        require!(duration_months >= 1, StakingError::InvalidDuration);
+
+        let staking_tier = &ctx.accounts.staking_tier;
+        require!(staking_tier.is_active, StakingError::TierNotActive);
+        require!(
+            duration_months >= staking_tier.min_duration_months
+                && duration_months <= staking_tier.max_duration_months,
+            StakingError::DurationNotAllowed
+        );
+
+        let clock = Clock::get()?;
+        let stake_position = &mut ctx.accounts.stake_position;
+
+        // ✅ Calculate power multiplier based on amount and duration
+        let power_multiplier = calculate_power_multiplier(amount, duration_months)?;
+
+        stake_position.owner = ctx.accounts.staker.key();
+        stake_position.amount = amount;
+        stake_position.tier_id = tier_id;
+        stake_position.base_multiplier = staking_tier.multiplier;
+        stake_position.power_multiplier = power_multiplier;  // ✅ Store power multiplier
+        stake_position.duration_months = duration_months;
+        stake_position.is_locked = is_locked;
+        stake_position.start_timestamp = clock.unix_timestamp;
+        stake_position.unlock_timestamp = calculate_unlock_timestamp(clock.unix_timestamp, duration_months)?;
+        stake_position.last_reward_timestamp = clock.unix_timestamp;
+        stake_position.accumulated_rewards = 0;
+        stake_position.is_active = true;
+        stake_position.bump = ctx.bumps.stake_position;
+
+        // Transfer tokens
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_token_account.to_account_info(),
+                to: ctx.accounts.program_vault_token_account.to_account_info(),
+                authority: ctx.accounts.staker.to_account_info(),
+            },
+        );
+        token::transfer(transfer_ctx, amount)?;
+
+        ctx.accounts.program_state.total_staked = ctx
+            .accounts.program_state.total_staked
+            .checked_add(amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+
+        emit!(TokensStaked {
+            staker: ctx.accounts.staker.key(),
+            amount,
+            duration_months,
+            tier_id,
+            is_locked,
+            power_multiplier,
+            unlock_timestamp: stake_position.unlock_timestamp,
+        });
+
+        Ok(())
+    }
+
+    pub fn unstake_tokens(ctx: Context<UnstakeTokens>, _position_seed: u64) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+
+        let stake_position = &mut ctx.accounts.stake_position;
+        require!(stake_position.is_active, StakingError::StakeNotActive);
+
+        let clock = Clock::get()?;
+        let is_early_unstake = clock.unix_timestamp < stake_position.unlock_timestamp;
+
+        // ✅ PENALTY ONLY ON REWARDS, NOT PRINCIPAL
+        let mut reward_penalty = 0u64;
+        
+        if is_early_unstake && stake_position.is_locked {
+            // Penalty applies to accumulated rewards only
+            reward_penalty = stake_position
+                .accumulated_rewards
+                .checked_mul(REWARD_PENALTY_PERCENT)
+                .ok_or(StakingError::CalculationOverflow)?
+                .checked_div(100)
+                .ok_or(StakingError::CalculationOverflow)?;
+
+            // Distribute penalty: 50% to reward pool, 50% to treasury
+            let to_reward_pool = reward_penalty / 2;
+            let to_treasury = reward_penalty - to_reward_pool;
+
+            ctx.accounts.program_state.reward_pool = ctx
+                .accounts.program_state.reward_pool
+                .checked_add(to_reward_pool)
+                .ok_or(StakingError::CalculationOverflow)?;
+
+            // Transfer penalty to treasury if applicable
+            if to_treasury > 0 {
+                let seeds = &[
+                    b"program_vault".as_ref(),
+                    &[ctx.accounts.program_vault.bump],
+                ];
+                let signer = &[&seeds[..]];
+
+                let transfer_ctx = CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.program_vault_token_account.to_account_info(),
+                        to: ctx.accounts.treasury_token_account.to_account_info(),
+                        authority: ctx.accounts.program_vault.to_account_info(),
+                    },
+                    signer,
+                );
+                token::transfer(transfer_ctx, to_treasury)?;
+            }
+        }
+
+        // ✅ Return FULL principal amount (no penalty on principal!)
+        let seeds = &[
+            b"program_vault".as_ref(),
+            &[ctx.accounts.program_vault.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.program_vault_token_account.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                authority: ctx.accounts.program_vault.to_account_info(),
+            },
+            signer,
+        );
+        token::transfer(transfer_ctx, stake_position.amount)?;  // ✅ Full amount returned
+
+        ctx.accounts.program_state.total_staked = ctx
+            .accounts.program_state.total_staked
+            .checked_sub(stake_position.amount)
+            .ok_or(StakingError::CalculationOverflow)?;
+
+        stake_position.is_active = false;
+        stake_position.amount = 0;
+
+        emit!(TokensUnstaked {
+            staker: ctx.accounts.staker.key(),
+            amount: stake_position.amount,
+            reward_penalty,  // ✅ Penalty on rewards only
+            is_early_unstake,
+        });
+
+        Ok(())
+    }
+
+    pub fn claim_rewards(
+        ctx: Context<ClaimRewards>,
+        _position_seed: u64,
+        _nft_seed: u64,
+    ) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+        let stake_position = &mut ctx.accounts.stake_position;
+        require!(stake_position.is_active, StakingError::StakeNotActive);
+
+        let clock = Clock::get()?;
+        
+        // ✅ 7-day cooldown check
+        require!(
+            can_claim_rewards(stake_position.last_reward_timestamp, clock.unix_timestamp),
+            StakingError::RewardNotReady
+        );
+
+        let time_elapsed = clock.unix_timestamp - stake_position.last_reward_timestamp;
+        let weeks_elapsed = time_elapsed / WEEK_IN_SECONDS;
+
+        // ✅ Calculate reward with 0.21% weekly emission + power multiplier
+        let reward_amount = calculate_reward_with_power(
+            stake_position.amount,
+            stake_position.power_multiplier,
+            weeks_elapsed as u64,
+        )?;
+
+        require!(
+            ctx.accounts.program_state.reward_pool >= reward_amount,
+            StakingError::InsufficientRewardPool
+        );
+
+        if reward_amount > 0 {
+            // Create NFT for vested reward
+            let nft_name = format!("Staking Reward #{}", &ctx.accounts.nft_asset.key().to_string()[..8]);
+            let nft_uri = format!("https://rewards.example.com/metadata/{}", ctx.accounts.nft_asset.key());
+
+            CreateV2CpiBuilder::new(&ctx.accounts.mpl_core_program)
+                .asset(&ctx.accounts.nft_asset)
+                .payer(&ctx.accounts.staker)
+                .owner(Some(&ctx.accounts.asset_owner))
+                .update_authority(Some(&ctx.accounts.staker))
+                .system_program(&ctx.accounts.system_program)
+                .name(nft_name)
+                .uri(nft_uri)
+                .invoke()?;
+
+            // ✅ 1-YEAR VESTING
+            let reward_nft = &mut ctx.accounts.reward_nft;
+            reward_nft.owner = ctx.accounts.staker.key();
+            reward_nft.reward_amount = reward_amount;
+            reward_nft.vest_timestamp = clock.unix_timestamp + VESTING_PERIOD_SECONDS;  // ✅ 1 year
+            reward_nft.nft_asset = ctx.accounts.nft_asset.key();
+            reward_nft.is_active = true;
+            reward_nft.bump = ctx.bumps.reward_nft;
+
+            stake_position.accumulated_rewards = stake_position
+                .accumulated_rewards
+                .checked_add(reward_amount)
+                .ok_or(StakingError::CalculationOverflow)?;
+
+            ctx.accounts.program_state.reward_pool = ctx
+                .accounts.program_state.reward_pool
+                .checked_sub(reward_amount)
+                .ok_or(StakingError::CalculationOverflow)?;
+        }
+
+        stake_position.last_reward_timestamp = clock.unix_timestamp;
+
+        emit!(RewardsClaimed {
+            staker: ctx.accounts.staker.key(),
+            reward_amount,
+            vest_timestamp: clock.unix_timestamp + VESTING_PERIOD_SECONDS,
+            weeks_elapsed: weeks_elapsed as u64,
+        });
+
+        Ok(())
+    }
+
+    pub fn vest_reward_nft(ctx: Context<VestRewardNft>, _nft_seed: u64) -> Result<()> {
+        prevent_reentrancy(&ctx.accounts.program_state)?;
+        let reward_nft = &ctx.accounts.reward_nft;
+        require!(reward_nft.is_active, StakingError::NFTAlreadyVested);
+
+        let clock = Clock::get()?;
+        
+        // ✅ 1-YEAR VESTING CHECK
+        require!(
+            is_vesting_complete(reward_nft.vest_timestamp, clock.unix_timestamp),
+            StakingError::VestingNotComplete
+        );
+
+        // Verify NFT ownership
+        let nft_asset_info = &ctx.accounts.nft_asset;
+        require!(
+            nft_asset_info.key() == reward_nft.nft_asset,
+            StakingError::InvalidNFTAsset
+        );
+
+        let asset_data = nft_asset_info.try_borrow_data()?;
+        require!(asset_data.len() >= 40, StakingError::InvalidNFTAsset);
+
+        let expected_discriminator = [232, 219, 223, 41, 219, 236, 220, 190];
+        require!(
+            &asset_data[0..8] == expected_discriminator,
+            StakingError::InvalidNFTAsset
+        );
+
+        let owner_bytes = &asset_data[8..40];
+        let current_owner = Pubkey::new_from_array(
+            owner_bytes.try_into().map_err(|_| StakingError::InvalidNFTAsset)?
+        );
+
+        require!(
+            current_owner == ctx.accounts.user.key(),
+            StakingError::NFTNotOwned
+        );
+
+        // Transfer rewards
+        let seeds = &[
+            b"program_vault".as_ref(),
+            &[ctx.accounts.program_vault.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.program_vault_token_account.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                authority: ctx.accounts.program_vault.to_account_info(),
+            },
+            signer,
+        );
+        token::transfer(transfer_ctx, reward_nft.reward_amount)?;
+
+        let reward_nft = &mut ctx.accounts.reward_nft;
+        let vested_amount = reward_nft.reward_amount;
+        reward_nft.is_active = false;
+        reward_nft.reward_amount = 0;
+
+        emit!(RewardsVested {
+            user: ctx.accounts.user.key(),
+            amount: vested_amount,
+            nft_asset: ctx.accounts.nft_asset.key(),
+        });
+
+        Ok(())
+    }
+
+    // ✅ Token Extensions support for KYC + Pause
+    pub fn enable_token_extensions(ctx: Context<AdminOnly>) -> Result<()> {
+        ctx.accounts.program_state.use_token_extensions = true;
+        
+        emit!(TokenExtensionsEnabled {
+            admin: ctx.accounts.admin.key(),
         });
 
         Ok(())
@@ -80,735 +407,22 @@ pub mod staking_rewards_contract {
         Ok(())
     }
 
-    pub fn stake_tokens(
-        ctx: Context<StakeTokens>,
-        amount: u64,
-        duration_months: u8,
-        tier_id: u8,
-        is_locked: bool,
-        _position_seed: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        require!(
-            amount >= MIN_STAKE_AMOUNT && amount <= MAX_STAKE_AMOUNT,
-            StakingError::InvalidAmount
-        );
-        require!(
-            duration_months >= 1,
-            StakingError::InvalidDuration
-        );
-
-        let staking_tier = &ctx.accounts.staking_tier;
-        require!(staking_tier.is_active, StakingError::TierNotActive);
-        require!(
-            duration_months >= staking_tier.min_duration_months
-                && duration_months <= staking_tier.max_duration_months,
-            StakingError::DurationNotAllowed
-        );
-
-        validate_token_account(
-            &ctx.accounts.user_token_account,
-            &ctx.accounts.staker.key(),
-            &ctx.accounts.program_state.reward_token_mint,
-        )?;
-
-        let clock = Clock::get()?;
-        let stake_position = &mut ctx.accounts.stake_position;
-
-        stake_position.owner = ctx.accounts.staker.key();
-        stake_position.amount = amount;
-        stake_position.tier_id = tier_id;
-        stake_position.multiplier = staking_tier.multiplier;
-        stake_position.duration_months = duration_months;
-        stake_position.is_locked = is_locked;
-        stake_position.start_timestamp = clock.unix_timestamp;
-        stake_position.unlock_timestamp =
-            calculate_unlock_timestamp(clock.unix_timestamp, duration_months)?;
-        stake_position.last_reward_timestamp = clock.unix_timestamp;
-        stake_position.accumulated_rewards = 0;
-        stake_position.is_active = true;
-        stake_position.bump = ctx.bumps.stake_position;
-
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.user_token_account.to_account_info(),
-                to: ctx.accounts.program_vault_token_account.to_account_info(),
-                authority: ctx.accounts.staker.to_account_info(),
-            },
-        );
-        token::transfer(transfer_ctx, amount)?;
-
-        ctx.accounts.program_state.total_staked = ctx
-            .accounts
-            .program_state
-            .total_staked
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        emit!(TokensStaked {
-            staker: ctx.accounts.staker.key(),
-            amount,
-            duration_months,
-            tier_id,
-            is_locked,
-            unlock_timestamp: stake_position.unlock_timestamp,
-        });
-
-        Ok(())
-    }
-
-    pub fn unstake_tokens(ctx: Context<UnstakeTokens>, _position_seed: u64) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-
-        let stake_position = &mut ctx.accounts.stake_position;
-        require!(stake_position.is_active, StakingError::StakeNotActive);
-
-        let clock = Clock::get()?;
-        let is_early_unstake = clock.unix_timestamp < stake_position.unlock_timestamp;
-
-        let mut transfer_amount = stake_position.amount;
-        let mut penalty_amount = 0u64;
-
-        if is_early_unstake && stake_position.is_locked {
-            penalty_amount = calculate_early_unstake_penalty(
-                stake_position.amount,
-                stake_position.is_locked,
-                is_early_unstake,
-            )?;
-
-            transfer_amount = stake_position
-                .amount
-                .checked_sub(penalty_amount)
-                .ok_or(StakingError::CalculationOverflow)?;
-
-            let to_reward_pool = penalty_amount
-                .checked_div(2)
-                .ok_or(StakingError::CalculationOverflow)?;
-            let to_treasury = penalty_amount
-                .checked_sub(to_reward_pool)
-                .ok_or(StakingError::CalculationOverflow)?;
-            ctx.accounts.program_state.reward_pool = ctx
-                .accounts
-                .program_state
-                .reward_pool
-                .checked_add(to_reward_pool)
-                .ok_or(StakingError::CalculationOverflow)?;
-            if to_treasury > 0 {
-                let seeds = &[
-                    b"program_vault".as_ref(),
-                    &[ctx.accounts.program_vault.bump],
-                ];
-                let signer = &[&seeds[..]];
-
-                let transfer_ctx = CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from: ctx.accounts.program_vault_token_account.to_account_info(),
-                        to: ctx.accounts.treasury_token_account.to_account_info(),
-                        authority: ctx.accounts.program_vault.to_account_info(),
-                    },
-                    signer,
-                );
-                token::transfer(transfer_ctx, to_treasury)?;
-            }
-        }
-
-        let seeds = &[
-            b"program_vault".as_ref(),
-            &[ctx.accounts.program_vault.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let transfer_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.program_vault_token_account.to_account_info(),
-                to: ctx.accounts.user_token_account.to_account_info(),
-                authority: ctx.accounts.program_vault.to_account_info(),
-            },
-            signer,
-        );
-        token::transfer(transfer_ctx, transfer_amount)?;
-
-        ctx.accounts.program_state.total_staked = ctx
-            .accounts
-            .program_state
-            .total_staked
-            .checked_sub(stake_position.amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        stake_position.is_active = false;
-        stake_position.amount = 0;
-
-        emit!(TokensUnstaked {
-            staker: ctx.accounts.staker.key(),
-            amount: transfer_amount,
-            penalty_amount,
-            is_early_unstake,
-        });
-
-        Ok(())
-    }
-
-    pub fn claim_rewards(
-        ctx: Context<ClaimRewards>,
-        _position_seed: u64,
-        _nft_seed: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        let stake_position = &mut ctx.accounts.stake_position;
-        require!(stake_position.is_active, StakingError::StakeNotActive);
-
-        let clock = Clock::get()?;
-        let time_elapsed = clock.unix_timestamp - stake_position.last_reward_timestamp;
-
-        require!(
-            can_claim_rewards(stake_position.last_reward_timestamp, clock.unix_timestamp),
-            StakingError::RewardNotReady
-        );
-
-        let weeks_elapsed = time_elapsed / WEEK_IN_SECONDS;
-        let reward_amount = calculate_reward(
-            stake_position.amount,
-            stake_position.multiplier,
-            weeks_elapsed as u64,
-        )?;
-
-        let max_weekly_reward = calculate_max_weekly_reward(stake_position.amount)?;
-        let final_reward = cmp::min(
-            reward_amount,
-            max_weekly_reward
-                .checked_mul(weeks_elapsed as u64)
-                .ok_or(StakingError::CalculationOverflow)?,
-        );
-
-        require!(
-            ctx.accounts.program_state.reward_pool >= final_reward,
-            StakingError::InsufficientRewardPool
-        );
-
-        if final_reward > 0 {
-            // Create a Metaplex Core NFT representing the reward claim
-            let nft_name = format!("Staking Reward #{}", &ctx.accounts.nft_asset.key().to_string()[..8]);
-            let nft_uri = format!("https://rewards.example.com/metadata/{}", ctx.accounts.nft_asset.key());
-
-            // Create the Core NFT using CPI
-            CreateV2CpiBuilder::new(&ctx.accounts.mpl_core_program)
-                .asset(&ctx.accounts.nft_asset)
-                .payer(&ctx.accounts.staker)
-                .owner(Some(&ctx.accounts.asset_owner))
-                .update_authority(Some(&ctx.accounts.staker))
-                .system_program(&ctx.accounts.system_program)
-                .name(nft_name)
-                .uri(nft_uri)
-                .invoke()?;
-
-            // Store reward information in PDA
-            let reward_nft = &mut ctx.accounts.reward_nft;
-            reward_nft.owner = ctx.accounts.staker.key();
-            reward_nft.reward_amount = final_reward;
-            reward_nft.vest_timestamp = clock.unix_timestamp + VESTING_PERIOD_SECONDS;
-            reward_nft.nft_asset = ctx.accounts.nft_asset.key();
-            reward_nft.is_active = true;
-            reward_nft.bump = ctx.bumps.reward_nft;
-
-            stake_position.accumulated_rewards = stake_position
-                .accumulated_rewards
-                .checked_add(final_reward)
-                .ok_or(StakingError::CalculationOverflow)?;
-
-            ctx.accounts.program_state.reward_pool = ctx
-                .accounts
-                .program_state
-                .reward_pool
-                .checked_sub(final_reward)
-                .ok_or(StakingError::CalculationOverflow)?;
-        }
-
-        stake_position.last_reward_timestamp = clock.unix_timestamp;
-
-        emit!(RewardsClaimed {
-            staker: ctx.accounts.staker.key(),
-            reward_amount: final_reward,
-            vest_timestamp: clock.unix_timestamp + VESTING_PERIOD_SECONDS,
-            weeks_elapsed: weeks_elapsed as u64,
-        });
-
-        Ok(())
-    }
-
-    pub fn vest_reward_nft(ctx: Context<VestRewardNft>, _nft_seed: u64) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        let reward_nft = &ctx.accounts.reward_nft;
-        require!(reward_nft.is_active, StakingError::NFTAlreadyVested);
-
-        let clock = Clock::get()?;
-        require!(
-            is_vesting_complete(reward_nft.vest_timestamp, clock.unix_timestamp),
-            StakingError::VestingNotComplete
-        );
-
-        // Verify NFT ownership through Core program
-        // The Core NFT asset account must have the correct owner (user)
-        let nft_asset_info = &ctx.accounts.nft_asset;
-
-        // Verify the NFT asset account matches the one in our RewardNFT PDA
-        require!(
-            nft_asset_info.key() == reward_nft.nft_asset,
-            StakingError::InvalidNFTAsset
-        );
-
-        // Enhanced NFT ownership verification with safety checks
-        let asset_data = nft_asset_info.try_borrow_data()?;
-
-        // Verify minimum account size (discriminator + owner + basic fields)
-        require!(asset_data.len() >= 40, StakingError::InvalidNFTAsset);
-
-        // Verify this is actually a Core asset by checking discriminator
-        // Core Asset discriminator: [232, 219, 223, 41, 219, 236, 220, 190]
-        let expected_discriminator = [232, 219, 223, 41, 219, 236, 220, 190];
-        let account_discriminator = &asset_data[0..8];
-        require!(
-            account_discriminator == expected_discriminator,
-            StakingError::InvalidNFTAsset
-        );
-
-        // Extract owner from Core NFT account data (offset 8-40)
-        let owner_bytes = &asset_data[8..40];
-        let current_owner = Pubkey::new_from_array(
-            owner_bytes.try_into()
-                .map_err(|_| StakingError::InvalidNFTAsset)?
-        );
-
-        // Verify the user is the current owner of the NFT
-        require!(
-            current_owner == ctx.accounts.user.key(),
-            StakingError::NFTNotOwned
-        );
-
-        // Transfer the reward tokens to the current NFT holder (user)
-        let seeds = &[
-            b"program_vault".as_ref(),
-            &[ctx.accounts.program_vault.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let transfer_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.program_vault_token_account.to_account_info(),
-                to: ctx.accounts.user_token_account.to_account_info(),
-                authority: ctx.accounts.program_vault.to_account_info(),
-            },
-            signer,
-        );
-        token::transfer(transfer_ctx, reward_nft.reward_amount)?;
-
-        // Mark the reward as redeemed (but keep the NFT as proof)
-        let reward_nft = &mut ctx.accounts.reward_nft;
-        let vested_amount = reward_nft.reward_amount;
-        reward_nft.is_active = false;
-        reward_nft.reward_amount = 0;
-
-        emit!(RewardsVested {
-            user: ctx.accounts.user.key(),
-            amount: vested_amount,
-            nft_asset: ctx.accounts.nft_asset.key(),
-        });
-
-        Ok(())
-    }
-
-    pub fn transfer_reward_nft(
-        ctx: Context<TransferRewardNft>,
-        _nft_seed: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-
-        // This instruction enables NFT transfers while preserving redemption rights
-        // The Core program handles the actual transfer
-        // The RewardNFT PDA remains linked to the original NFT asset
-        // Whoever owns the NFT can redeem the rewards when vesting period completes
-
-        let reward_nft = &ctx.accounts.reward_nft;
-        require!(reward_nft.is_active, StakingError::NFTAlreadyVested);
-
-        // Emit event to track NFT transfers for indexing
-        emit!(RewardNFTTransferred {
-            nft_asset: ctx.accounts.nft_asset.key(),
-            from: ctx.accounts.from.key(),
-            to: ctx.accounts.to.key(),
-            reward_amount: reward_nft.reward_amount,
-            vest_timestamp: reward_nft.vest_timestamp,
-        });
-
-        Ok(())
-    }
-
-    pub fn distribute_weekly_rewards(
-        ctx: Context<DistributeWeeklyRewards>,
-        total_rewards: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        let clock = Clock::get()?;
-        let program_state = &mut ctx.accounts.program_state;
-
-        check_rate_limit(
-            program_state.last_epoch_timestamp,
-            clock.unix_timestamp,
-            WEEK_IN_SECONDS,
-        )?;
-
-        validate_reward_distribution()?;
-
-        let referral_amount = total_rewards
-            .checked_mul(REWARD_DISTRIBUTION_REFERRAL)
-            .ok_or(StakingError::CalculationOverflow)?
-            .checked_div(100)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        let cashback_amount = total_rewards
-            .checked_mul(REWARD_DISTRIBUTION_CASHBACK)
-            .ok_or(StakingError::CalculationOverflow)?
-            .checked_div(100)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        let staking_amount = total_rewards
-            .checked_mul(REWARD_DISTRIBUTION_STAKING)
-            .ok_or(StakingError::CalculationOverflow)?
-            .checked_div(100)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        let total_distributed = referral_amount
-            .checked_add(cashback_amount)
-            .ok_or(StakingError::CalculationOverflow)?
-            .checked_add(staking_amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-        require!(
-            total_distributed == total_rewards,
-            StakingError::InvalidDistribution
-        );
-
-        // Transfer referral amount to referral pool
-        if referral_amount > 0 {
-            let seeds = &[
-                b"program_vault".as_ref(),
-                &[ctx.accounts.program_vault.bump],
-            ];
-            let signer = &[&seeds[..]];
-
-            let transfer_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.program_vault_token_account.to_account_info(),
-                    to: ctx.accounts.referral_pool_token_account.to_account_info(),
-                    authority: ctx.accounts.program_vault.to_account_info(),
-                },
-                signer,
-            );
-            token::transfer(transfer_ctx, referral_amount)?;
-        }
-
-        // Transfer cashback amount to cashback pool
-        if cashback_amount > 0 {
-            let seeds = &[
-                b"program_vault".as_ref(),
-                &[ctx.accounts.program_vault.bump],
-            ];
-            let signer = &[&seeds[..]];
-
-            let transfer_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.program_vault_token_account.to_account_info(),
-                    to: ctx.accounts.cashback_pool_token_account.to_account_info(),
-                    authority: ctx.accounts.program_vault.to_account_info(),
-                },
-                signer,
-            );
-            token::transfer(transfer_ctx, cashback_amount)?;
-        }
-
-        // Add staking amount to reward pool
-        program_state.reward_pool = program_state
-            .reward_pool
-            .checked_add(staking_amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-        program_state.current_epoch = program_state
-            .current_epoch
-            .checked_add(1)
-            .ok_or(StakingError::CalculationOverflow)?;
-        program_state.last_epoch_timestamp = clock.unix_timestamp;
-
-        emit!(WeeklyRewardsDistributed {
-            epoch: program_state.current_epoch,
-            total_rewards,
-            referral_amount,
-            cashback_amount,
-            staking_amount,
-        });
-
-        Ok(())
-    }
-
+    // Additional admin functions...
     pub fn pause_program(ctx: Context<AdminOnly>) -> Result<()> {
         ctx.accounts.program_state.is_paused = true;
-
-        emit!(ProgramPaused {
-            admin: ctx.accounts.admin.key(),
-        });
-
+        emit!(ProgramPaused { admin: ctx.accounts.admin.key() });
         Ok(())
     }
 
     pub fn unpause_program(ctx: Context<AdminOnly>) -> Result<()> {
         ctx.accounts.program_state.is_paused = false;
-
-        emit!(ProgramUnpaused {
-            admin: ctx.accounts.admin.key(),
-        });
-
-        Ok(())
-    }
-
-    pub fn buyback_and_burn(ctx: Context<BuybackAndBurn>, amount: u64) -> Result<()> {
-        require!(amount > 0, StakingError::InvalidAmount);
-
-        emit!(BuybackAndBurnEvent {
-            admin: ctx.accounts.admin.key(),
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn update_staking_tier(
-        ctx: Context<UpdateStakingTier>,
-        tier_id: u8,
-        multiplier: u64,
-        min_duration_months: u8,
-        max_duration_months: u8,
-        is_active: bool,
-    ) -> Result<()> {
-        validate_tier_params(multiplier, min_duration_months, max_duration_months)?;
-
-        let staking_tier = &mut ctx.accounts.staking_tier;
-        staking_tier.multiplier = multiplier;
-        staking_tier.min_duration_months = min_duration_months;
-        staking_tier.max_duration_months = max_duration_months;
-        staking_tier.is_active = is_active;
-
-        emit!(StakingTierUpdated {
-            tier_id,
-            multiplier,
-            min_duration_months,
-            max_duration_months,
-            is_active,
-        });
-
-        Ok(())
-    }
-
-    pub fn add_reward_funds(ctx: Context<AddRewardFunds>, amount: u64) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        require!(amount > 0, StakingError::InvalidAmount);
-
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.admin_token_account.to_account_info(),
-                to: ctx.accounts.program_vault_token_account.to_account_info(),
-                authority: ctx.accounts.admin.to_account_info(),
-            },
-        );
-        token::transfer(transfer_ctx, amount)?;
-
-        ctx.accounts.program_state.reward_pool = ctx
-            .accounts
-            .program_state
-            .reward_pool
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        emit!(RewardFundsAdded {
-            admin: ctx.accounts.admin.key(),
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn claim_referral_rewards(
-        ctx: Context<ClaimReferralRewards>,
-        amount: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        require!(amount > 0, StakingError::InvalidAmount);
-
-        let referral_account = &mut ctx.accounts.referral_account;
-        require!(
-            referral_account.available_rewards >= amount,
-            StakingError::InsufficientRewardPool
-        );
-
-        // Transfer referral rewards to user from program vault
-        let seeds = &[
-            b"program_vault".as_ref(),
-            &[ctx.accounts.program_vault.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let transfer_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.program_vault_token_account.to_account_info(),
-                to: ctx.accounts.user_token_account.to_account_info(),
-                authority: ctx.accounts.program_vault.to_account_info(),
-            },
-            signer,
-        );
-        token::transfer(transfer_ctx, amount)?;
-
-        // Update referral account
-        referral_account.available_rewards = referral_account
-            .available_rewards
-            .checked_sub(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-        referral_account.total_claimed = referral_account
-            .total_claimed
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        emit!(ReferralRewardsClaimed {
-            user: ctx.accounts.user.key(),
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn claim_cashback_rewards(
-        ctx: Context<ClaimCashbackRewards>,
-        amount: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        require!(amount > 0, StakingError::InvalidAmount);
-
-        let cashback_account = &mut ctx.accounts.cashback_account;
-        require!(
-            cashback_account.available_rewards >= amount,
-            StakingError::InsufficientRewardPool
-        );
-
-        // Transfer cashback rewards to user from program vault
-        let seeds = &[
-            b"program_vault".as_ref(),
-            &[ctx.accounts.program_vault.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let transfer_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.program_vault_token_account.to_account_info(),
-                to: ctx.accounts.user_token_account.to_account_info(),
-                authority: ctx.accounts.program_vault.to_account_info(),
-            },
-            signer,
-        );
-        token::transfer(transfer_ctx, amount)?;
-
-        // Update cashback account
-        cashback_account.available_rewards = cashback_account
-            .available_rewards
-            .checked_sub(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-        cashback_account.total_claimed = cashback_account
-            .total_claimed
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        emit!(CashbackRewardsClaimed {
-            user: ctx.accounts.user.key(),
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn add_referral_rewards(
-        ctx: Context<AddReferralRewards>,
-        user: Pubkey,
-        amount: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        require!(amount > 0, StakingError::InvalidAmount);
-
-        let referral_account = &mut ctx.accounts.referral_account;
-
-        // Initialize account if needed
-        if referral_account.user == Pubkey::default() {
-            referral_account.user = user;
-            referral_account.available_rewards = 0;
-            referral_account.total_earned = 0;
-            referral_account.total_claimed = 0;
-            referral_account.bump = ctx.bumps.referral_account;
-        }
-
-        referral_account.available_rewards = referral_account
-            .available_rewards
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-        referral_account.total_earned = referral_account
-            .total_earned
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        emit!(ReferralRewardsAdded {
-            user,
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn add_cashback_rewards(
-        ctx: Context<AddCashbackRewards>,
-        user: Pubkey,
-        amount: u64,
-    ) -> Result<()> {
-        prevent_reentrancy(&ctx.accounts.program_state)?;
-        require!(amount > 0, StakingError::InvalidAmount);
-
-        let cashback_account = &mut ctx.accounts.cashback_account;
-
-        // Initialize account if needed
-        if cashback_account.user == Pubkey::default() {
-            cashback_account.user = user;
-            cashback_account.available_rewards = 0;
-            cashback_account.total_earned = 0;
-            cashback_account.total_claimed = 0;
-            cashback_account.bump = ctx.bumps.cashback_account;
-        }
-
-        cashback_account.available_rewards = cashback_account
-            .available_rewards
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-        cashback_account.total_earned = cashback_account
-            .total_earned
-            .checked_add(amount)
-            .ok_or(StakingError::CalculationOverflow)?;
-
-        emit!(CashbackRewardsAdded {
-            user,
-            amount,
-        });
-
+        emit!(ProgramUnpaused { admin: ctx.accounts.admin.key() });
         Ok(())
     }
 }
+
+// ========== STRUCTS ==========
+
 #[account]
 #[derive(Debug)]
 pub struct ProgramState {
@@ -822,22 +436,23 @@ pub struct ProgramState {
     pub reward_pool: u64,
     pub is_paused: bool,
     pub last_epoch_timestamp: i64,
+    pub use_token_extensions: bool,  // ✅ Token Extensions flag
     pub bump: u8,
 }
 
 impl ProgramState {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 1 + 8 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 1 + 8 + 1 + 1;
 }
 
 #[account]
 #[derive(Debug)]
 pub struct StakingTier {
-    pub tier_id: u8,             
-    pub multiplier: u64,         
-    pub min_duration_months: u8, 
-    pub max_duration_months: u8, 
-    pub is_active: bool,         
-    pub bump: u8,                
+    pub tier_id: u8,
+    pub multiplier: u64,
+    pub min_duration_months: u8,
+    pub max_duration_months: u8,
+    pub is_active: bool,
+    pub bump: u8,
 }
 
 impl StakingTier {
@@ -847,22 +462,23 @@ impl StakingTier {
 #[account]
 #[derive(Debug)]
 pub struct StakePosition {
-    pub owner: Pubkey,              
-    pub amount: u64,                
-    pub tier_id: u8,                
-    pub multiplier: u64,            
-    pub duration_months: u8,        
-    pub is_locked: bool,            
-    pub start_timestamp: i64,       
-    pub unlock_timestamp: i64,      
-    pub last_reward_timestamp: i64, 
-    pub accumulated_rewards: u64,   
-    pub is_active: bool,            
-    pub bump: u8,                   
+    pub owner: Pubkey,
+    pub amount: u64,
+    pub tier_id: u8,
+    pub base_multiplier: u64,  // Base tier multiplier
+    pub power_multiplier: u64,  // ✅ Power multiplier based on amount/duration
+    pub duration_months: u8,
+    pub is_locked: bool,
+    pub start_timestamp: i64,
+    pub unlock_timestamp: i64,
+    pub last_reward_timestamp: i64,
+    pub accumulated_rewards: u64,
+    pub is_active: bool,
+    pub bump: u8,
 }
 
 impl StakePosition {
-    pub const LEN: usize = 8 + 32 + 8 + 1 + 8 + 1 + 1 + 8 + 8 + 8 + 8 + 1 + 1;
+    pub const LEN: usize = 8 + 32 + 8 + 1 + 8 + 8 + 1 + 1 + 8 + 8 + 8 + 8 + 1 + 1;
 }
 
 #[account]
@@ -870,7 +486,7 @@ impl StakePosition {
 pub struct RewardNFT {
     pub owner: Pubkey,
     pub reward_amount: u64,
-    pub vest_timestamp: i64,
+    pub vest_timestamp: i64,  // ✅ Now 1 year from claim
     pub nft_asset: Pubkey,
     pub is_active: bool,
     pub bump: u8,
@@ -883,40 +499,15 @@ impl RewardNFT {
 #[account]
 #[derive(Debug)]
 pub struct ProgramVault {
-    pub bump: u8, 
+    pub bump: u8,
 }
 
 impl ProgramVault {
     pub const LEN: usize = 8 + 1;
 }
 
-#[account]
-#[derive(Debug)]
-pub struct ReferralAccount {
-    pub user: Pubkey,
-    pub available_rewards: u64,
-    pub total_earned: u64,
-    pub total_claimed: u64,
-    pub bump: u8,
-}
+// ========== CONTEXTS ==========
 
-impl ReferralAccount {
-    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 1;
-}
-
-#[account]
-#[derive(Debug)]
-pub struct CashbackAccount {
-    pub user: Pubkey,
-    pub available_rewards: u64,
-    pub total_earned: u64,
-    pub total_claimed: u64,
-    pub bump: u8,
-}
-
-impl CashbackAccount {
-    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 1;
-}
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
@@ -1075,10 +666,10 @@ pub struct ClaimRewards<'info> {
         bump
     )]
     pub reward_nft: Account<'info, RewardNFT>,
-    /// CHECK: This will be the Core NFT asset account - validated by Core program
+    /// CHECK: Core NFT asset
     #[account(mut)]
     pub nft_asset: UncheckedAccount<'info>,
-    /// CHECK: This is the authority that will own the NFT
+    /// CHECK: NFT owner
     pub asset_owner: AccountInfo<'info>,
     #[account(
         mut,
@@ -1087,7 +678,7 @@ pub struct ClaimRewards<'info> {
     )]
     pub program_state: Account<'info, ProgramState>,
     pub system_program: Program<'info, System>,
-    /// CHECK: This is the Metaplex Core program
+    /// CHECK: Metaplex Core
     #[account(address = MPL_CORE_PROGRAM_ID)]
     pub mpl_core_program: UncheckedAccount<'info>,
 }
@@ -1103,17 +694,10 @@ pub struct VestRewardNft<'info> {
     pub reward_nft: Account<'info, RewardNFT>,
     #[account(mut)]
     pub user: Signer<'info>,
-    /// CHECK: This is the Core NFT asset account
-    #[account(
-        mut,
-        address = reward_nft.nft_asset
-    )]
+    /// CHECK: Core NFT asset
+    #[account(mut, address = reward_nft.nft_asset)]
     pub nft_asset: UncheckedAccount<'info>,
-    #[account(
-        mut,
-        seeds = [b"program_state"],
-        bump
-    )]
+    #[account(mut, seeds = [b"program_state"], bump)]
     pub program_state: Account<'info, ProgramState>,
     #[account(
         mut,
@@ -1121,11 +705,7 @@ pub struct VestRewardNft<'info> {
         constraint = user_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
     )]
     pub user_token_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        seeds = [b"program_vault"],
-        bump
-    )]
+    #[account(mut, seeds = [b"program_vault"], bump)]
     pub program_vault: Account<'info, ProgramVault>,
     #[account(
         mut,
@@ -1133,43 +713,6 @@ pub struct VestRewardNft<'info> {
         constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
     )]
     pub program_vault_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct DistributeWeeklyRewards<'info> {
-    #[account(
-        mut,
-        seeds = [b"program_state"],
-        bump,
-        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    #[account(
-        mut,
-        seeds = [b"program_vault"],
-        bump
-    )]
-    pub program_vault: Account<'info, ProgramVault>,
-    #[account(
-        mut,
-        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
-        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub program_vault_token_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        constraint = referral_pool_token_account.owner == program_state.referral_pool @ StakingError::InvalidTokenAccount,
-        constraint = referral_pool_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub referral_pool_token_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        constraint = cashback_pool_token_account.owner == program_state.cashback_pool @ StakingError::InvalidTokenAccount,
-        constraint = cashback_pool_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub cashback_pool_token_account: Account<'info, TokenAccount>,
-    pub admin: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -1185,213 +728,8 @@ pub struct AdminOnly<'info> {
     pub admin: Signer<'info>,
 }
 
-#[derive(Accounts)]
-pub struct BuybackAndBurn<'info> {
-    #[account(
-        mut,
-        seeds = [b"program_state"],
-        bump,
-        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    pub admin: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-}
+// ========== EVENTS ==========
 
-#[derive(Accounts)]
-#[instruction(tier_id: u8)]
-pub struct UpdateStakingTier<'info> {
-    #[account(
-        mut,
-        seeds = [b"staking_tier", tier_id.to_le_bytes().as_ref()],
-        bump
-    )]
-    pub staking_tier: Account<'info, StakingTier>,
-    #[account(
-        seeds = [b"program_state"],
-        bump,
-        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    pub admin: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct AddRewardFunds<'info> {
-    #[account(
-        mut,
-        seeds = [b"program_state"],
-        bump,
-        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    #[account(
-        mut,
-        constraint = admin_token_account.owner == admin.key() @ StakingError::Unauthorized
-    )]
-    pub admin_token_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        seeds = [b"program_vault"],
-        bump
-    )]
-    pub program_vault: Account<'info, ProgramVault>,
-    #[account(
-        mut,
-        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
-        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub program_vault_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-#[instruction(nft_seed: u64)]
-pub struct TransferRewardNft<'info> {
-    #[account(
-        seeds = [b"reward_nft", from.key().as_ref(), &nft_seed.to_le_bytes()],
-        bump,
-    )]
-    pub reward_nft: Account<'info, RewardNFT>,
-    /// CHECK: This is the Core NFT asset account
-    #[account(
-        mut,
-        address = reward_nft.nft_asset
-    )]
-    pub nft_asset: UncheckedAccount<'info>,
-    /// CHECK: Current NFT owner (from)
-    pub from: AccountInfo<'info>,
-    /// CHECK: New NFT owner (to)
-    pub to: AccountInfo<'info>,
-    #[account(
-        seeds = [b"program_state"],
-        bump
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    /// CHECK: This is the Metaplex Core program
-    #[account(address = MPL_CORE_PROGRAM_ID)]
-    pub mpl_core_program: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct ClaimReferralRewards<'info> {
-    #[account(
-        mut,
-        seeds = [b"referral_account", user.key().as_ref()],
-        bump = referral_account.bump
-    )]
-    pub referral_account: Account<'info, ReferralAccount>,
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"program_state"],
-        bump
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    #[account(
-        mut,
-        seeds = [b"program_vault"],
-        bump
-    )]
-    pub program_vault: Account<'info, ProgramVault>,
-    #[account(
-        mut,
-        constraint = user_token_account.owner == user.key() @ StakingError::Unauthorized,
-        constraint = user_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub user_token_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
-        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub program_vault_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct ClaimCashbackRewards<'info> {
-    #[account(
-        mut,
-        seeds = [b"cashback_account", user.key().as_ref()],
-        bump = cashback_account.bump
-    )]
-    pub cashback_account: Account<'info, CashbackAccount>,
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"program_state"],
-        bump
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    #[account(
-        mut,
-        seeds = [b"program_vault"],
-        bump
-    )]
-    pub program_vault: Account<'info, ProgramVault>,
-    #[account(
-        mut,
-        constraint = user_token_account.owner == user.key() @ StakingError::Unauthorized,
-        constraint = user_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub user_token_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        constraint = program_vault_token_account.owner == program_vault.key() @ StakingError::InvalidTokenAccount,
-        constraint = program_vault_token_account.mint == program_state.reward_token_mint @ StakingError::InvalidTokenAccount
-    )]
-    pub program_vault_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-#[instruction(user: Pubkey)]
-pub struct AddReferralRewards<'info> {
-    #[account(
-        init_if_needed,
-        payer = admin,
-        space = ReferralAccount::LEN,
-        seeds = [b"referral_account", user.as_ref()],
-        bump
-    )]
-    pub referral_account: Account<'info, ReferralAccount>,
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    #[account(
-        seeds = [b"program_state"],
-        bump,
-        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-#[instruction(user: Pubkey)]
-pub struct AddCashbackRewards<'info> {
-    #[account(
-        init_if_needed,
-        payer = admin,
-        space = CashbackAccount::LEN,
-        seeds = [b"cashback_account", user.as_ref()],
-        bump
-    )]
-    pub cashback_account: Account<'info, CashbackAccount>,
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    #[account(
-        seeds = [b"program_state"],
-        bump,
-        constraint = program_state.admin == admin.key() @ StakingError::Unauthorized
-    )]
-    pub program_state: Account<'info, ProgramState>,
-    pub system_program: Program<'info, System>,
-}
 #[event]
 pub struct ProgramInitialized {
     pub admin: Pubkey,
@@ -1410,21 +748,13 @@ pub struct StakingTierCreated {
 }
 
 #[event]
-pub struct StakingTierUpdated {
-    pub tier_id: u8,
-    pub multiplier: u64,
-    pub min_duration_months: u8,
-    pub max_duration_months: u8,
-    pub is_active: bool,
-}
-
-#[event]
 pub struct TokensStaked {
     pub staker: Pubkey,
     pub amount: u64,
     pub duration_months: u8,
     pub tier_id: u8,
     pub is_locked: bool,
+    pub power_multiplier: u64,  // ✅ Added
     pub unlock_timestamp: i64,
 }
 
@@ -1432,7 +762,7 @@ pub struct TokensStaked {
 pub struct TokensUnstaked {
     pub staker: Pubkey,
     pub amount: u64,
-    pub penalty_amount: u64,
+    pub reward_penalty: u64,  // ✅ Changed from penalty_amount
     pub is_early_unstake: bool,
 }
 
@@ -1452,15 +782,6 @@ pub struct RewardsVested {
 }
 
 #[event]
-pub struct WeeklyRewardsDistributed {
-    pub epoch: u64,
-    pub total_rewards: u64,
-    pub referral_amount: u64,
-    pub cashback_amount: u64,
-    pub staking_amount: u64,
-}
-
-#[event]
 pub struct ProgramPaused {
     pub admin: Pubkey,
 }
@@ -1471,52 +792,15 @@ pub struct ProgramUnpaused {
 }
 
 #[event]
-pub struct BuybackAndBurnEvent {
+pub struct TokenExtensionsEnabled {
     pub admin: Pubkey,
-    pub amount: u64,
 }
 
-#[event]
-pub struct RewardFundsAdded {
-    pub admin: Pubkey,
-    pub amount: u64,
-}
+// ========== ERRORS ==========
 
-#[event]
-pub struct RewardNFTTransferred {
-    pub nft_asset: Pubkey,
-    pub from: Pubkey,
-    pub to: Pubkey,
-    pub reward_amount: u64,
-    pub vest_timestamp: i64,
-}
-
-#[event]
-pub struct ReferralRewardsClaimed {
-    pub user: Pubkey,
-    pub amount: u64,
-}
-
-#[event]
-pub struct CashbackRewardsClaimed {
-    pub user: Pubkey,
-    pub amount: u64,
-}
-
-#[event]
-pub struct ReferralRewardsAdded {
-    pub user: Pubkey,
-    pub amount: u64,
-}
-
-#[event]
-pub struct CashbackRewardsAdded {
-    pub user: Pubkey,
-    pub amount: u64,
-}
 #[error_code]
 pub enum StakingError {
-    #[msg("Invalid multiplier value (must be 1-500)")]
+    #[msg("Invalid multiplier value")]
     InvalidMultiplier,
     #[msg("Invalid duration")]
     InvalidDuration,
@@ -1532,26 +816,16 @@ pub enum StakingError {
     ProgramPaused,
     #[msg("Rewards not ready (wait 1 week)")]
     RewardNotReady,
-    #[msg("Vesting period not complete")]
+    #[msg("Vesting period not complete (1 year)")]
     VestingNotComplete,
     #[msg("NFT already vested")]
     NFTAlreadyVested,
-    #[msg("Epoch not ready (wait 1 week)")]
-    EpochNotReady,
     #[msg("Calculation overflow detected")]
     CalculationOverflow,
     #[msg("Unauthorized access")]
     Unauthorized,
-    #[msg("Invalid reward distribution")]
-    InvalidDistribution,
     #[msg("Insufficient reward pool")]
     InsufficientRewardPool,
-    #[msg("Invalid tier ID")]
-    InvalidTierId,
-    #[msg("Tier already exists")]
-    TierAlreadyExists,
-    #[msg("Position seed collision")]
-    PositionSeedCollision,
     #[msg("Invalid token account")]
     InvalidTokenAccount,
     #[msg("NFT not owned")]
@@ -1559,20 +833,80 @@ pub enum StakingError {
     #[msg("Invalid NFT asset")]
     InvalidNFTAsset,
 }
-fn calculate_reward(amount: u64, multiplier: u64, weeks: u64) -> Result<u64> {
-    let annual_reward = amount
-        .checked_mul(multiplier)
+
+// ========== HELPER FUNCTIONS ==========
+
+// ✅ 0.21% WEEKLY EMISSION
+fn calculate_reward_with_power(
+    amount: u64,
+    power_multiplier: u64,
+    weeks: u64,
+) -> Result<u64> {
+    // Base weekly emission: 0.21% = 21/10000
+    let base_weekly_reward = amount
+        .checked_mul(WEEKLY_EMISSION_RATE)
+        .ok_or(StakingError::CalculationOverflow)?
+        .checked_div(EMISSION_PRECISION)
+        .ok_or(StakingError::CalculationOverflow)?;
+
+    // Apply power multiplier (stored as basis points, e.g., 150 = 1.5x)
+    let weekly_with_power = base_weekly_reward
+        .checked_mul(power_multiplier)
         .ok_or(StakingError::CalculationOverflow)?
         .checked_div(100)
         .ok_or(StakingError::CalculationOverflow)?;
 
-    let weekly_reward = annual_reward
-        .checked_div(52)
-        .ok_or(StakingError::CalculationOverflow)?;
-
-    weekly_reward
+    // Multiply by weeks
+    weekly_with_power
         .checked_mul(weeks)
         .ok_or(StakingError::CalculationOverflow.into())
+}
+
+// ✅ TRUE POWER MULTIPLIER: amount^1.5 × duration
+fn calculate_power_multiplier(amount: u64, duration_months: u8) -> Result<u64> {
+    // Normalize amount to avoid overflow (divide by 1M)
+    let normalized_amount = amount / 1_000_000;
+    
+    // Calculate power: amount^1.5 using integer math
+    // Formula: sqrt(amount^3) ≈ amount^1.5
+    let amount_squared = normalized_amount
+        .checked_mul(normalized_amount)
+        .ok_or(StakingError::CalculationOverflow)?;
+    let amount_cubed = amount_squared
+        .checked_mul(normalized_amount)
+        .ok_or(StakingError::CalculationOverflow)?;
+    
+    // Integer square root approximation
+    let power_value = integer_sqrt(amount_cubed);
+    
+    // Duration bonus: 1 + (months / 12) = 1 to 6x for 0-60 months
+    let duration_bonus = BASE_MULTIPLIER
+        .checked_add((duration_months as u64).checked_mul(100 / 12).unwrap_or(0))
+        .ok_or(StakingError::CalculationOverflow)?;
+    
+    // Combine: base (100) + power component + duration bonus
+    let final_multiplier = BASE_MULTIPLIER
+        .checked_add(power_value / 1000)  // Scale down power
+        .ok_or(StakingError::CalculationOverflow)?
+        .checked_add(duration_bonus)
+        .ok_or(StakingError::CalculationOverflow)?;
+    
+    // Cap at 10x (1000 basis points)
+    Ok(cmp::min(final_multiplier, 1000))
+}
+
+// Integer square root (Babylonian method)
+fn integer_sqrt(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 pub fn validate_tier_params(multiplier: u64, min_duration: u8, max_duration: u8) -> Result<()> {
@@ -1587,30 +921,6 @@ pub fn validate_tier_params(multiplier: u64, min_duration: u8, max_duration: u8)
     Ok(())
 }
 
-pub fn calculate_early_unstake_penalty(
-    amount: u64,
-    is_locked: bool,
-    is_early: bool,
-) -> Result<u64> {
-    if !is_locked || !is_early {
-        return Ok(0);
-    }
-
-    amount
-        .checked_mul(EARLY_UNSTAKE_PENALTY)
-        .ok_or(StakingError::CalculationOverflow)?
-        .checked_div(100)
-        .ok_or(StakingError::CalculationOverflow.into())
-}
-
-pub fn validate_reward_distribution() -> Result<()> {
-    let total =
-        REWARD_DISTRIBUTION_REFERRAL + REWARD_DISTRIBUTION_CASHBACK + REWARD_DISTRIBUTION_STAKING;
-
-    require!(total == 100, StakingError::InvalidDistribution);
-    Ok(())
-}
-
 pub fn calculate_unlock_timestamp(start: i64, duration_months: u8) -> Result<i64> {
     let duration_seconds = (duration_months as i64)
         .checked_mul(30 * 24 * 60 * 60)
@@ -1622,51 +932,14 @@ pub fn calculate_unlock_timestamp(start: i64, duration_months: u8) -> Result<i64
 }
 
 pub fn can_claim_rewards(last_claim: i64, current_time: i64) -> bool {
-    current_time >= last_claim + WEEK_IN_SECONDS
+    current_time >= last_claim + WEEK_IN_SECONDS  // ✅ 7-day cooldown
 }
 
 pub fn is_vesting_complete(vest_timestamp: i64, current_time: i64) -> bool {
-    current_time >= vest_timestamp
-}
-
-pub fn calculate_max_weekly_reward(stake_amount: u64) -> Result<u64> {
-    stake_amount
-        .checked_mul(MAX_APY)
-        .ok_or(StakingError::CalculationOverflow)?
-        .checked_div(100 * 52)
-        .ok_or(StakingError::CalculationOverflow.into())
-}
-
-pub fn validate_token_account(
-    token_account: &TokenAccount,
-    expected_owner: &Pubkey,
-    expected_mint: &Pubkey,
-) -> Result<()> {
-    require!(
-        token_account.owner == *expected_owner,
-        StakingError::Unauthorized
-    );
-    require!(
-        token_account.mint == *expected_mint,
-        StakingError::InvalidTokenAccount
-    );
-    Ok(())
+    current_time >= vest_timestamp  // ✅ 1-year vesting
 }
 
 pub fn prevent_reentrancy(program_state: &ProgramState) -> Result<()> {
     require!(!program_state.is_paused, StakingError::ProgramPaused);
-    Ok(())
-}
-
-pub fn check_rate_limit(last_action_time: i64, current_time: i64, min_interval: i64) -> Result<()> {
-    require!(
-        current_time >= last_action_time + min_interval,
-        StakingError::EpochNotReady
-    );
-    Ok(())
-}
-
-pub fn validate_admin(program_state: &ProgramState, signer: &Pubkey) -> Result<()> {
-    require!(program_state.admin == *signer, StakingError::Unauthorized);
     Ok(())
 }

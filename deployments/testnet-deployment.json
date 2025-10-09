@@ -1,12 +1,16 @@
 {
   "network": "testnet",
-  "programId": "AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N",
+  "programId": "9zbbGQ1crgrG9dj7UXCTbx9JkXm522fg7AprTwSBHoa6",
   "admin": "ExE7s4rvdQw3QAGAMoaqJXBMMTczwxNuRTAYPHbQtyB1",
-  "treasury": "2bP3HuccMJnut5yYAUxgFRzbzFQ9w2xshRuMFJEbnd15",
-  "tokenMint": "4srETGbTwqfVh1pzwcNhh7eT3wvYN9m4G2KkmPsdunTU",
-  "programState": "FiZqTvPN8oE1p4zTuaB73716yHgq9Jh7WzwDEQ7dTXt2",
-  "programVault": "Rti3vxgbyBuxVyMbSBmwKDx4j7g7kqMBhqXHiEto5rj",
-  "stakingTier": "4Mu26DwypetEgdDxHUUDv8mGgzXT8mh3RPH6Uc4E5dXs",
-  "programVaultTokenAccount": "7mFm69uKvzbBcyehxmFfMwRs4eXEo5yGovA9a35hqJ9P",
-  "deploymentDate": "2025-09-24T09:10:10.367Z"
+  "treasury": "9cxQuTA7cnQGxSePmws585qmfHgG4rVo4CE7ZdMXF5VA",
+  "referralPool": "8zLieW2Mu2gQYfeKUaUHCPq7UpWgXgXjfrbrvdmv9o39",
+  "cashbackPool": "H3Tq9P1Nbd7aacoyFDMAwbjiJmEUSQcbwWAm3R8KvMbw",
+  "tokenMint": "6sv452x39rAThH5LTFYYE5W59GQbaAcGmQXSRSuzujH6",
+  "programState": "6Z4wjpbQ9oBcdrkum4h8FdhPvmsKVFpSe8cLuNjg15ri",
+  "programVault": "4a9sV3wXwbHyey9uCTW1kEdycsu5GxbrvXcjZXcqAYVD",
+  "stakingTier": "8qxrKyc3yRmxA9NW16acdRyNJokMxnScYNg38UdAVHnF",
+  "programVaultTokenAccount": "9ogDQxYWbBegCQ3F8xRT1Y5jPvwCFXEmxFmquEsEuvd1",
+  "referralPoolTokenAccount": "8Q1RPJmhzG38PXHLYAeqm9BPjFx5FqJ7b44XogBx5cKT",
+  "cashbackPoolTokenAccount": "7E3zuZBiQTqGU3cF1nhLziHoSeJcecoGJv4oKHFyXpdb",
+  "deploymentDate": "2025-10-09T12:22:15.901Z"
 }

@@ -1,10 +1,10 @@
 import * as anchor from "@coral-xyz/anchor";
-import { 
-  PublicKey, 
-  Keypair, 
-  SystemProgram 
+import {
+  PublicKey,
+  Keypair,
+  SystemProgram
 } from "@solana/web3.js";
-import { 
+import {
   TOKEN_PROGRAM_ID,
   createMint,
   mintTo,
@@ -13,6 +13,10 @@ import {
 } from "@solana/spl-token";
 import fs from "fs";
 import path from "path";
+import dotenv from "dotenv";
+
+// Load environment variables
+dotenv.config({ path: path.join(__dirname, "../config.env") });
 
 async function main() {
   console.log("🚀 Deploying Solana Staking Contract to Testnet...\n");
@@ -21,7 +25,7 @@ async function main() {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  const programId = new PublicKey("AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N");
+  const programId = new PublicKey("9zbbGQ1crgrG9dj7UXCTbx9JkXm522fg7AprTwSBHoa6");
   
   console.log("📋 Configuration:");
   console.log(`   Program ID: ${programId.toString()}`);
@@ -45,18 +49,7 @@ async function main() {
   console.log(`   Cashback Pool: ${cashbackPool.publicKey.toString()}\n`);
 
   try {
-    // Step 1: Create reward token mint
-    console.log("1️⃣ Creating reward token mint...");
-    const tokenMint = await createMint(
-      provider.connection,
-      walletKeypair,
-      admin,
-      null,
-      9 // 9 decimals
-    );
-    console.log(`   ✅ Token Mint: ${tokenMint.toString()}\n`);
-
-    // Step 2: Find PDAs
+    // Step 1: Find PDAs first
     const [programState] = PublicKey.findProgramAddressSync(
       [Buffer.from("program_state")],
       programId
@@ -75,8 +68,29 @@ async function main() {
     console.log(`   Program Vault: ${programVault.toString()}`);
     console.log(`   Staking Tier: ${stakingTier.toString()}\n`);
 
+    // Step 2: Check if program is already deployed
+    console.log("2️⃣ Checking existing deployment...");
+    const program = anchor.workspace.StakingRewardsContract;
+
+    let tokenMint;
+    try {
+      const existingState = await program.account.programState.fetch(programState);
+      tokenMint = existingState.rewardTokenMint;
+      console.log(`   ✅ Using existing token mint: ${tokenMint.toString()}\n`);
+    } catch (error) {
+      console.log("   No existing deployment found, creating new token mint...");
+      tokenMint = await createMint(
+        provider.connection,
+        walletKeypair,
+        admin,
+        null,
+        9 // 9 decimals
+      );
+      console.log(`   ✅ New token mint created: ${tokenMint.toString()}\n`);
+    }
+
     // Step 3: Create program vault token account
-    console.log("2️⃣ Creating program vault token account...");
+    console.log("3️⃣ Creating program vault token account...");
     const programVaultAta = await getOrCreateAssociatedTokenAccount(
       provider.connection,
       walletKeypair,
@@ -87,7 +101,7 @@ async function main() {
     console.log(`   ✅ Program Vault ATA: ${programVaultAta.address.toString()}\n`);
 
     // Step 4: Mint initial tokens
-    console.log("3️⃣ Minting initial tokens...");
+    console.log("4️⃣ Minting initial tokens...");
     await mintTo(
       provider.connection,
       walletKeypair,
@@ -98,8 +112,8 @@ async function main() {
     );
     console.log(`   ✅ Minted 1,000,000 tokens\n`);
 
-    // Step 4: Create referral and cashback pool token accounts
-    console.log("4️⃣ Creating referral and cashback pool token accounts...");
+    // Step 5: Create referral and cashback pool token accounts
+    console.log("5️⃣ Creating referral and cashback pool token accounts...");
     const referralPoolAta = await getOrCreateAssociatedTokenAccount(
       provider.connection,
       walletKeypair,
@@ -117,30 +131,86 @@ async function main() {
     console.log(`   ✅ Referral Pool ATA: ${referralPoolAta.address.toString()}`);
     console.log(`   ✅ Cashback Pool ATA: ${cashbackPoolAta.address.toString()}\n`);
 
-    // Step 5: Initialize the program
-    console.log("5️⃣ Initializing the program...");
-    const program = anchor.workspace.StakingRewardsContract;
+    // Step 6: Initialize the program (if not already initialized)
+    console.log("6️⃣ Checking if program is already initialized...");
 
-    await program.methods
-      .initialize(
-        admin,
-        tokenMint,
-        treasury.publicKey,
-        referralPool.publicKey,
-        cashbackPool.publicKey
-      )
-      .accounts({
-        programState: programState,
-        programVault: programVault,
-        admin: admin,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .signers([walletKeypair])
-      .rpc();
+    let programStateAccount;
+    try {
+      programStateAccount = await program.account.programState.fetch(programState);
+      console.log(`   ✅ Program already initialized with admin: ${programStateAccount.admin.toString()}`);
+      console.log(`   ✅ Using existing token mint: ${programStateAccount.rewardTokenMint.toString()}\n`);
 
-    console.log(`   ✅ Program initialized successfully\n`);
+      // Update tokenMint to use the existing one
+      tokenMint = programStateAccount.rewardTokenMint;
+    } catch (error) {
+      console.log("   Program not initialized yet, initializing now...");
+      await program.methods
+        .initialize(
+          admin,
+          tokenMint,
+          treasury.publicKey,
+          referralPool.publicKey,
+          cashbackPool.publicKey
+        )
+        .accounts({
+          programState: programState,
+          programVault: programVault,
+          admin: admin,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([walletKeypair])
+        .rpc();
 
-    // Step 6: Save deployment info
+      console.log(`   ✅ Program initialized successfully\n`);
+
+      // Fetch the newly created state
+      programStateAccount = await program.account.programState.fetch(programState);
+    }
+
+    // Step 7: Create default staking tier (if not already created)
+    console.log("7️⃣ Checking default staking tier...");
+    try {
+      const stakingTierAccount = await program.account.stakingTier.fetch(stakingTier);
+      console.log(`   ✅ Staking tier already exists with multiplier: ${stakingTierAccount.multiplier.toString()}\n`);
+    } catch (error) {
+      console.log("   Creating default staking tier...");
+      await program.methods
+        .createStakingTier(
+          1, // tier_id
+          new anchor.BN(150), // 150% multiplier
+          1, // min_duration_months
+          60 // max_duration_months (5 years for long-term staking)
+        )
+        .accounts({
+          stakingTier: stakingTier,
+          admin: admin,
+          programState: programState,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([walletKeypair])
+        .rpc();
+      console.log(`   ✅ Default staking tier created\n`);
+    }
+
+    // Step 8: Enable Token Extensions (KYC + pause capability)
+    console.log("8️⃣ Checking Token Extensions status...");
+    const currentState = await program.account.programState.fetch(programState);
+    if (currentState.useTokenExtensions) {
+      console.log(`   ✅ Token Extensions already enabled\n`);
+    } else {
+      console.log("   Enabling Token Extensions for KYC + pause functionality...");
+      await program.methods
+        .enableTokenExtensions()
+        .accounts({
+          programState: programState,
+          admin: admin,
+        })
+        .signers([walletKeypair])
+        .rpc();
+      console.log(`   ✅ Token Extensions enabled for future KYC + pause features\n`);
+    }
+
+    // Step 9: Save deployment info
     const deploymentInfo = {
       network: "testnet",
       programId: programId.toString(),
@@ -163,8 +233,8 @@ async function main() {
 
     console.log("💾 Deployment info saved to: deployments/testnet-deployment.json\n");
 
-    // Step 7: Verify deployment
-    console.log("6️⃣ Verifying deployment...");
+    // Step 10: Verify deployment
+    console.log("🔟 Verifying deployment...");
     const vaultBalance = await getAccount(provider.connection, programVaultAta.address);
 
     console.log("📊 Deployment Summary:");

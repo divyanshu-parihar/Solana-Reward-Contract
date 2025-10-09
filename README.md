@@ -27,17 +27,17 @@ npm test
 ### 2. Set Environment Variables
 Create a `.env` file in your project root:
 ```bash
-ANCHOR_PROVIDER_URL=https://api.testnet.solana.com
-ANCHOR_WALLET=/Users/soloking/.config/solana/testnet-keypair.json
+ANCHOR_PROVIDER_URL=https://api.devnet.solana.com
+ANCHOR_WALLET=/Users/soloking/.config/solana/devnet-keypair.json
 ```
 
 Or set them in your terminal:
 ```bash
-export ANCHOR_PROVIDER_URL=https://api.testnet.solana.com
-export ANCHOR_WALLET=/Users/soloking/.config/solana/testnet-keypair.json
+export ANCHOR_PROVIDER_URL=https://api.devnet.solana.com
+export ANCHOR_WALLET=/Users/soloking/.config/solana/devnet-keypair.json
 ```
 
-### 3. Deploy to Testnet
+### 3. Deploy to Devnet
 ```bash
 npm run deploy
 ```
@@ -54,15 +54,15 @@ The deployment script will:
 
 After deployment, you'll get:
 - **Program ID:** `AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N`
-- **Token Mint:** Generated during deployment
-- **Program State:** Generated during deployment
-- **Program Vault:** Generated during deployment
+- **Token Mint:** `31zVwSyQZ2fvDp4Yg994PqVjC5kcsZqG8oTtHrfa7WGE`
+- **Program State:** `FiZqTvPN8oE1p4zTuaB73716yHgq9Jh7WzwDEQ7dTXt2`
+- **Program Vault:** `Rti3vxgbyBuxVyMbSBmwKDx4j7g7kqMBhqXHiEto5rj`
 
 ## 🔗 Explorer Links
 
 Check your deployment on Solana Explorer:
-- **Program:** `https://explorer.solana.com/address/{PROGRAM_ID}?cluster=testnet`
-- **Token:** `https://explorer.solana.com/address/{TOKEN_MINT}?cluster=testnet`
+- **Program:** `https://explorer.solana.com/address/AKnc8CqVVCyBuzzyvNEPQZGYCiEiqRneETDSgm1ZU69N?cluster=devnet`
+- **Token:** `https://explorer.solana.com/address/31zVwSyQZ2fvDp4Yg994PqVjC5kcsZqG8oTtHrfa7WGE?cluster=devnet`
 
 ## 📊 Test Results
 
@@ -75,7 +75,7 @@ Check your deployment on Solana Explorer:
 
 Your Solana staking contract is now:
 - ✅ **Fully tested** and verified
-- ✅ **Deployed** to testnet
+- ✅ **Deployed** to devnet
 - ✅ **Ready** for mainnet deployment
 - ✅ **Production-ready** for user interactions
 

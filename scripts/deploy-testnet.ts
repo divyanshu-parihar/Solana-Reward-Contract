@@ -25,7 +25,7 @@ async function main() {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  const programId = new PublicKey("9zbbGQ1crgrG9dj7UXCTbx9JkXm522fg7AprTwSBHoa6");
+  const programId = new PublicKey("3Li2pDFFDmzrtw7zJpGDmaYFoRvje8xQ7pvt1vkTzLRg");
   
   console.log("📋 Configuration:");
   console.log(`   Program ID: ${programId.toString()}`);
